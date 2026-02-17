@@ -1,4 +1,4 @@
-cat > README.md <<'EOF'
+
 # luci-app-telemt
 
 <table width="100%">
