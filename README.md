@@ -1,4 +1,3 @@
-
 # luci-app-telemt - OpenWRT WEB interface
 
 <table width="100%">
@@ -8,9 +7,8 @@
   </tr>
   <tr>
     <td valign="top">
-      Веб-интерфейс (LuCI) для управления MTProto-прокси <a href="https://github.com/telemt/telemt">Telemt</a> на маршрутизаторах OpenWrt.
-      
-      Пакет работает как генератор файла конфигурации <code>telemt.toml</code> и управляет жизненным циклом демона через подсистему <code>procd</code>.
+      Веб-интерфейс (LuCI) для управления MTProto-прокси <a href="https://github.com/telemt/telemt">Telemt</a> на маршрутизаторах OpenWrt.<br><br>
+      Пакет работает как генератор файла конфигурации <code>telemt.toml</code> и управляет жизненным циклом демона через подсистему <code>procd</code>.<br>
       Реализовано отображение статуса процесса, правила firewall'а для выбранноо порта, полу-автоматическое определение WAN IP-адреса для подстановки в прокси-ссылку, генерация секрета для каждого пользователя, управлених их квотами.  
       <br><br>
       <b>Требования:</b>
@@ -32,7 +30,7 @@
       </ul>
     </td>
     <td valign="top">
-      A LuCI web interface for managing the <a href="https://github.com/telemt/telemt">Telemt</a> MTProto proxy on OpenWrt routers. 
+      A LuCI web interface for managing the <a href="https://github.com/telemt/telemt">Telemt</a> MTProto proxy on OpenWrt routers.<br><br>
       This package acts as a configuration generator for <code>telemt.toml</code> and manages the daemon's lifecycle via <code>procd</code>.
       <br><br>
       <b>Requirements:</b>
