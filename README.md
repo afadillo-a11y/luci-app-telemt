@@ -24,7 +24,7 @@ This package provides a seamless GUI to configure, manage, and monitor your Tele
 ## 🚀 Installation
 
 1. Go to the [Releases](../../releases) page.
-2. Download the `luci-app-telemt` IPK package and the correct `telemt` binary IPK for your router's architecture (e.g., `aarch64_generic`).
+2. Download the `luci-app-telemt` IPK rollup package with the correct `telemt` binary for your router's architecture (e.g., `aarch64_generic`).
 3. Upload them to your router (e.g., `/tmp/`) and install via SSH:
    ```bash
    opkg update
