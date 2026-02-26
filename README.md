@@ -1,6 +1,5 @@
 # luci-app-telemt - OpenWrt Web Interface for telemt MTProxy service
 
-
 <table width="100%">
   <tr>
     <th width="50%">🇷🇺 Русский</th>
@@ -12,11 +11,13 @@
       Пакет работает как умный генератор файла конфигурации <code>telemt.toml</code> и управляет жизненным циклом демона через подсистему <code>procd</code>.<br>
       Реализована полноценная панель управления (Dashboard) с отображением статуса процесса, живой статистикой трафика, управлением квотами пользователей и автоматическим открытием портов.  
       <br><br>
+      📖 <b>Архитектура проекта:</b> Подробное описание логики работы модулей и процесса инсталляции доступно в <a href="STRUCTURE.md">STRUCTURE.md</a>.
+      <br><br>
       <b>Требования:</b>
       <ul>
         <li><b>ОС:</b> OpenWrt 21.02 — 25.xx (полная поддержка VDOM)</li>
         <li><b>Зависимости:</b> <code>luci-base</code>, <code>luci-compat</code>, <code>ca-bundle</code>, <code>qrencode</code> (для генерации QR-кодов)</li>
-        <li><b>Движок:</b> бинарный файл <code>telemt</code> <b>версии 3.0.15 или 3.1.x+ LTS</b>.</li>[https://github.com/Medvedolog/telemt/releases]
+        <li><b>Движок:</b> бинарный файл <code>telemt</code> <b>версии 3.0.15 или 3.1.x+ LTS</b> (<a href="https://github.com/Medvedolog/telemt/releases">Скачать релизы</a>).</li>
       </ul>
       <b>Ключевые возможности:</b>
       <ul>
@@ -39,11 +40,13 @@
       This package acts as a smart configuration generator for <code>telemt.toml</code> and manages the daemon's lifecycle via the <code>procd</code> init system.<br>
       It features a full dashboard with process status, live traffic statistics, user quota management, and automatic port forwarding.
       <br><br>
+      📖 <b>Project Architecture:</b> For an in-depth look at module workflows and the installation process, see <a href="STRUCTURE.md">STRUCTURE.md</a>.
+      <br><br>
       <b>Requirements:</b>
       <ul>
         <li><b>OS:</b> OpenWrt 21.02 — 25.xx (full VDOM compatibility)</li>
         <li><b>Dependencies:</b> <code>luci-base</code>, <code>luci-compat</code>, <code>ca-bundle</code>, <code>qrencode</code> (for QR generation)</li>
-        <li><b>Engine:</b> <code>telemt</code> binary <b>version 3.0.15 or 3.1.x+ LTS</b>.</li>[https://github.com/Medvedolog/telemt/releases]
+        <li><b>Engine:</b> <code>telemt</code> binary <b>version 3.0.15 or 3.1.x+ LTS</b> (<a href="https://github.com/Medvedolog/telemt/releases">Download releases</a>).</li>
       </ul>
       <b>Key Features:</b>
       <ul>
