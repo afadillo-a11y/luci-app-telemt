@@ -214,7 +214,10 @@ start_service() {
         fi
     done
 
-    # Base TOML generation
+    # ==========================================================================
+    # TOML GENERATION 
+    # Generates a minimal compliant TOML with dynamic UI additions
+    # ==========================================================================
     cat <<TOML > "$TMP_CONF"
 [network]
 ipv4 = $v4_str
@@ -261,6 +264,13 @@ TOML
     config_foreach add_user_link user
     local links_str=""; [ -s "$TMP_LINKS" ] && links_str=$(sed 's/, $//' "$TMP_LINKS")
     printf '\n[general.links]\nshow = [%s]\n' "$links_str" >> "$TMP_CONF"
+    
+    # --------------------------------------------------------------------------
+    # Telemt 3.1.0 Feature: Override detected IP with explicit host for links
+    # --------------------------------------------------------------------------
+    if [ -n "$announce_ip" ]; then
+        printf 'public_host = "%s"\n' "$announce_ip" >> "$TMP_CONF"
+    fi
 
     cat <<TOML >> "$TMP_CONF"
 
@@ -272,6 +282,13 @@ TOML
 
     if [ "$listen_ipv4" -eq 1 ]; then echo "listen_addr_ipv4 = \"0.0.0.0\"" >> "$TMP_CONF"; fi
     if [ "$listen_ipv6" -eq 1 ]; then echo "listen_addr_ipv6 = \"::\"" >> "$TMP_CONF"; fi
+
+    # --------------------------------------------------------------------------
+    # Telemt 3.1.0 Feature: Advanced TLS record emulation masking
+    # Requires a temporary directory to cache fetched server profile data.
+    # We place it in /var/etc/ so it resides in fast RAM and clears on reboot.
+    # --------------------------------------------------------------------------
+    mkdir -p /var/etc/telemt_tlsfront
 
     cat <<TOML >> "$TMP_CONF"
 
@@ -285,6 +302,8 @@ client_ack = $tm_ack
 tls_domain = "$domain"
 mask = true
 mask_port = 443
+tls_emulation = true
+tls_front_dir = "/var/etc/telemt_tlsfront"
 fake_cert_len = $fake_cert_len
 tls_full_cert_ttl_secs = $tls_full_cert_ttl_secs
 
@@ -358,4 +377,3 @@ stop_service() {
 
 # Allow external services to trigger a reload (via ubus)
 service_triggers() { procd_add_reload_trigger "telemt"; }
-
