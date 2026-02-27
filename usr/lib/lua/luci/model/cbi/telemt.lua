@@ -1,12 +1,13 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.1.2-2 (Golden Master with Strict OS Parsing)
+-- Version: 3.1.2-3 (Golden Master - Strict UI Branches)
 -- 
 -- Architecture:
 -- - Map: Connects to '/etc/config/telemt' and automatically handles I/O.
 -- - AJAX Endpoints: Intercepts POST/GET requests for live metrics, logs, and FW status.
 -- - DOM Mutation (Client-Side): Bulletproof OpenWrt 21-25 compatibility using 
---   /etc/openwrt_release OS version parsing to strictly isolate LuCI2 VDOM patches.
+--   /etc/openwrt_release OS version parsing. Strictly separates 25+ (LuCI2 VDOM) 
+--   from 21-24 (Native HTML).
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -29,14 +30,14 @@ local function read_file(path)
 end
 
 -- ==============================================================================
--- OS VERSION PARSER (Strict VDOM Guard)
--- Detects if we are running OpenWrt 24.x, 25.x, or SNAPSHOT to apply LuCI2 hacks
+-- OS VERSION PARSER (Strict UI Branching)
+-- Detects if we are running OpenWrt 25.x, SNAPSHOT, or RC.
+-- Versions 21, 22, 23, 24 will use the legacy, clean, native column approach.
 -- ==============================================================================
 local is_owrt25_lua = "false"
 local ow_rel = sys.exec("cat /etc/openwrt_release 2>/dev/null") or ""
 if ow_rel:match("DISTRIB_RELEASE='25") or ow_rel:match('DISTRIB_RELEASE="25') or 
-   ow_rel:match("DISTRIB_RELEASE='24") or ow_rel:match('DISTRIB_RELEASE="24') or 
-   ow_rel:match("SNAPSHOT") then
+   ow_rel:match("SNAPSHOT") or ow_rel:match("%-rc") then
     is_owrt25_lua = "true"
 end
 
@@ -237,7 +238,7 @@ if not is_ajax then
     end
 end
 
-m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.2-2</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
+m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.2-3</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
 
 m.on_commit = function(self) 
     sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'")
@@ -444,6 +445,7 @@ html body #cbi-telemt-user .cbi-button-add:hover,
 html body #cbi-telemt-user .cbi-button-add:focus,
 html body #cbi-telemt-user .cbi-button-add:active {
     background-color: #00a000 !important;
+    background-image: none !important; /* Forces solid background in Material/Bootstrap themes */
     color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
     opacity: 1 !important;
@@ -842,7 +844,6 @@ function isTemplateRow(row) {
 function injectUI() {
     fixTabIsolation();
     
-    // Gated native column rename (Only applies safely to OpenWrt 21-24)
     if (!is_owrt25) {
         var firstTh = document.querySelector('#cbi-telemt-user .cbi-section-table-titles th:first-child') || 
                       document.querySelector('#cbi-telemt-user thead th:first-child');
@@ -882,16 +883,8 @@ function injectUI() {
         var match = secInp.name.match(/cbid\.telemt\.([^.]+)\.secret/);
         var uName = match ? match[1] : '?';
 
-        // THE BULLETPROOF CHECK: 
-        // Only trigger the blue name injection if the backend confirmed OpenWrt 25.x (LuCI2 VDOM)
-        // AND the DOM confirms the native column was destroyed.
-        var firstCell = row.firstElementChild;
-        var isFallbackMode = false;
-        if (is_owrt25 && firstCell && firstCell.contains(secInp)) {
-            isFallbackMode = true;
-        }
-
-        if (isFallbackMode) {
+        if (is_owrt25) {
+            // Strictly OpenWrt 25+: inject blue tag above secret
             var secretTd = secInp.closest('td');
             if (secretTd) {
                 var nameDiv = secretTd.querySelector('.telemt-fallback-name');
@@ -903,8 +896,21 @@ function injectUI() {
                 }
                 nameDiv.innerText = '[ user: ' + uName + ' ]'; 
             }
+        } else {
+            // Strictly OpenWrt 21-24: format the native left column, NO blue tag above secret
+            var firstCell = row.firstElementChild;
+            if (firstCell && !firstCell.contains(secInp)) {
+                var span = firstCell.querySelector('.telemt-user-col-text');
+                if (!span) {
+                    span = document.createElement('span');
+                    span.className = 'telemt-user-col-text';
+                    span.style.cssText = 'color: #005ce6 !important; font-weight: bold !important;';
+                    firstCell.innerHTML = '';
+                    firstCell.appendChild(span);
+                }
+                span.innerText = uName;
+            }
         }
-        // Notice: No 'else' block here. Older OpenWrt versions simply keep their native clean Name column.
         
         if(secInp) {
             if(secInp.value.trim() === "") { secInp.value = genRandHex(); secInp.dispatchEvent(new Event('change', {bubbles: true})); }
