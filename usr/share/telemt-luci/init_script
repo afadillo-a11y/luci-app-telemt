@@ -13,23 +13,15 @@ STOP=10
 USE_PROCD=1
 CONF=/var/etc/telemt.toml
 
-# Define a custom administrative command visible in LuCI / init systems
 extra_command "run_save_stats" "Force dump prometheus metrics to RAM before shutdown"
 
 PROG="$(command -v telemt 2>/dev/null || echo /usr/bin/telemt)"
 
-# Utility: Validates if an IP string is in correct CIDR notation (e.g. 192.168.1.0/24)
+# Utilities
 is_cidr() { case "$1" in *[!0-9A-Fa-f:./]* ) return 1 ;; esac; echo "$1" | grep -qE '^[0-9A-Fa-f:.]+/[0-9]{1,3}$'; }
-
-# Utility: Validates if a string is a strictly unsigned integer
 is_uint() { echo "$1" | grep -qE '^[0-9]+$'; }
+sanitize_toml_value() { printf '%s' "$1" | tr -d '\n\r' | sed 's/["\\]/\\&/g'; }
 
-# Utility: Cleanses user input to prevent TOML parsing errors or script injections
-sanitize_toml_value() {
-    printf '%s' "$1" | tr -d '\n\r' | sed 's/["\\]/\\&/g'
-}
-
-# Utility: Polyfill fetch wrapper supporting both uclient-fetch (OpenWrt default) and wget
 fetch_metrics() {
     local url="$1"
     if command -v uclient-fetch >/dev/null 2>&1; then uclient-fetch -q --timeout=3 -O - "$url"
@@ -37,12 +29,6 @@ fetch_metrics() {
     else return 1; fi
 }
 
-# ------------------------------------------------------------------------------
-# Function: run_save_stats
-# Intercepts daemon shutdown to query the local Prometheus metrics port.
-# Saves accumulated downloaded/uploaded bytes per user to a temporary state file,
-# ensuring user quotas and statistics survive service restarts.
-# ------------------------------------------------------------------------------
 run_save_stats() {
     local m_port=$(uci -q get telemt.general.metrics_port || echo 9091)
     local tmp_file="/tmp/telemt_stats.txt"
@@ -57,7 +43,6 @@ run_save_stats() {
     if [ -z "$raw" ]; then return 0; fi
     touch "$tmp_file" 2>/dev/null
     
-    # Parse Prometheus payload via awk and calculate offsets
     echo "$raw" | awk '
     /^telemt_user_octets_to_client/ { match($0, /user="[^"]+"/); if(RSTART) { u=substr($0, RSTART+6, RLENGTH-7); tx[u]+=$2; users[u]=1 } }
     /^telemt_user_octets_from_client/ { match($0, /user="[^"]+"/); if(RSTART) { u=substr($0, RSTART+6, RLENGTH-7); rx[u]+=$2; users[u]=1 } }
@@ -73,11 +58,6 @@ run_save_stats() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# Function: start_service
-# Main Procd startup routine. Retrieves all UCI parameters, applies defaults, 
-# structures them into a TOML payload, and requests procd to track the binary.
-# ------------------------------------------------------------------------------
 start_service() {
     umask 077
     config_load telemt
@@ -86,7 +66,6 @@ start_service() {
     config_get_bool enabled general enabled 0
     if [ "$enabled" -ne 1 ]; then return 0; fi
 
-    # Extract binary version for LuCI diagnostic display
     if [ -x "$PROG" ]; then
         mkdir -p /var/etc
         local ver=$(grep -a -m1 -i 'MTProxy v' "$PROG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
@@ -96,10 +75,9 @@ start_service() {
         fi
     fi
 
-    # Variable allocations
     local metrics_port m_alo m_alan metrics_whitelist domain log_level use_mp use_stun ad_tag announce_ip external_ip use_socks socks_addr socks_user socks_pass
     local tm_handshake tm_connect tm_keepalive tm_ack listen_ipv4 listen_ipv6 prefer_ip auto_fw fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
-    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all
+    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all mask_proxy_protocol
     
     local TMP_LINKS=$(mktemp /tmp/telemt_links.XXXXXX)
     local TMP_USERS=$(mktemp /tmp/telemt_users.XXXXXX)
@@ -109,10 +87,8 @@ start_service() {
     local TMP_EXP=$(mktemp /tmp/telemt_exp.XXXXXX)
     local TMP_CONF=$(mktemp /var/etc/telemt.toml.XXXXXX)
     
-    # Cleanup trap ensuring temporary files are purged on failure
     trap 'rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"' EXIT INT TERM
     
-    # UCI parameter fetching
     config_get mode general mode "tls"
     config_get port general port "4443"
     config_get metrics_port general metrics_port "9091"
@@ -149,8 +125,8 @@ start_service() {
     config_get tls_full_cert_ttl_secs general tls_full_cert_ttl_secs "90"
     config_get replay_window_secs general replay_window_secs "1800"
     config_get_bool ignore_time_skew general ignore_time_skew 0
+    config_get mask_proxy_protocol general mask_proxy_protocol "0"
     
-    # Input sanitization
     domain=$(echo "$domain" | tr -cd 'A-Za-z0-9.-')
     ad_tag=$(sanitize_toml_value "$ad_tag" | tr -cd 'A-Fa-f0-9')
     announce_ip=$(sanitize_toml_value "$announce_ip")
@@ -161,7 +137,6 @@ start_service() {
     if [ -n "$external_ip" ]; then external_ip=$(echo "$external_ip" | awk '{print $1}'); fi
     if [ -z "$announce_ip" ] && [ -n "$external_ip" ]; then announce_ip="$external_ip"; fi
     
-    # Boolean casting for TOML
     local mp_str="false"; [ "$use_mp" -eq 1 ] && mp_str="true"
     local stun_str="false"; [ "$use_stun" -eq 1 ] && stun_str="true"
     local v4_str="false"; [ "$listen_ipv4" -eq 1 ] && v4_str="true"
@@ -173,11 +148,11 @@ start_service() {
     
     local m_cls="false"; local m_sec="false"; local m_tls="false"
     case "$mode" in
-        "classic") m_cls="true" ;; "dd") m_sec="true" ;;
+        "classic") m_cls="true" ;;
+        "dd") m_sec="true" ;;
         "all") m_cls="true"; m_sec="true"; m_tls="true" ;; *) m_tls="true" ;;
     esac
 
-    # Metrics Network ACL builder
     local wl_toml=""
     [ "$m_alo" -eq 1 ] && wl_toml="\"127.0.0.1/32\", \"::1/128\""
     
@@ -214,10 +189,6 @@ start_service() {
         fi
     done
 
-    # ==========================================================================
-    # TOML GENERATION 
-    # Generates a minimal compliant TOML with dynamic UI additions
-    # ==========================================================================
     cat <<TOML > "$TMP_CONF"
 [network]
 ipv4 = $v4_str
@@ -260,7 +231,6 @@ secure = $m_sec
 tls = $m_tls
 TOML
 
-    # Callbacks to parse specific user-blocks from UCI
     add_user_link() { printf '"%s", ' "$1" >> "$TMP_LINKS"; }
     add_user_secret() { local sec; config_get sec "$1" secret; if [ -n "$sec" ]; then echo "$1 = \"$sec\"" >> "$TMP_USERS"; fi; }
     add_user_conns() { local c; config_get c "$1" max_tcp_conns; if [ -n "$c" ] && [ "$c" != "unlimited" ] && is_uint "$c"; then echo "$1 = $c" >> "$TMP_CONNS"; fi; }
@@ -272,10 +242,6 @@ TOML
     local links_str=""; [ -s "$TMP_LINKS" ] && links_str=$(sed 's/, $//' "$TMP_LINKS")
     printf '\n[general.links]\nshow = [%s]\n' "$links_str" >> "$TMP_CONF"
     
-    # --------------------------------------------------------------------------
-    # Telemt 3.1.0 Feature: Override auto-detected IP with explicit host/domain
-    # ensures correct tg:// link generation behind NAT.
-    # --------------------------------------------------------------------------
     if [ -n "$announce_ip" ]; then
         printf 'public_host = "%s"\n' "$announce_ip" >> "$TMP_CONF"
     fi
@@ -288,11 +254,7 @@ metrics_port = $metrics_port
 metrics_whitelist = [$wl_toml]
 TOML
 
-    # --------------------------------------------------------------------------
-    # Smart Fallback: If user explicitly disabled STUN probing, bypass the 
-    # network prober's strict NAT check by feeding the Announce IP directly 
-    # into the listener block. The prober will read it and allow ME Proxy.
-    # --------------------------------------------------------------------------
+    # Smart STUN Fallback: Feed IP to listener directly if probing is disabled
     if [ "$listen_ipv4" -eq 1 ]; then 
         if [ "$use_stun" -eq 0 ] && [ -n "$announce_ip" ]; then
             printf '\n[[server.listeners]]\nip = "0.0.0.0"\nannounce = "%s"\n' "$announce_ip" >> "$TMP_CONF"
@@ -305,11 +267,6 @@ TOML
         echo "listen_addr_ipv6 = \"::\"" >> "$TMP_CONF"
     fi
 
-    # --------------------------------------------------------------------------
-    # Telemt 3.1.0 Feature: Advanced TLS record emulation masking
-    # Requires a temporary directory to cache fetched server profile data.
-    # Placed in /var/etc/ to reside in volatile RAM, clearing on reboot.
-    # --------------------------------------------------------------------------
     mkdir -p /var/etc/telemt_tlsfront
 
     cat <<TOML >> "$TMP_CONF"
@@ -324,6 +281,7 @@ client_ack = $tm_ack
 tls_domain = "$domain"
 mask = true
 mask_port = 443
+mask_proxy_protocol = $mask_proxy_protocol
 tls_emulation = true
 tls_front_dir = "/var/etc/telemt_tlsfront"
 fake_cert_len = $fake_cert_len
@@ -348,7 +306,6 @@ TOML
     if [ -s "$TMP_QUOTA" ]; then printf '\n[access.user_data_quota]\n' >> "$TMP_CONF"; cat "$TMP_QUOTA" >> "$TMP_CONF"; fi
     if [ -s "$TMP_EXP" ]; then printf '\n[access.user_expirations]\n' >> "$TMP_CONF"; cat "$TMP_EXP" >> "$TMP_CONF"; fi
     
-    # Advanced: Upstream proxy routing
     if [ "$use_socks" -eq 1 ]; then
         printf '\n[[upstreams]]\ntype = "socks5"\naddress = "%s"\nenabled = true\nweight = 1\n' "$socks_addr" >> "$TMP_CONF"
         if [ -n "$socks_user" ] && [ -n "$socks_pass" ]; then printf 'username = "%s"\npassword = "%s"\n' "$socks_user" "$socks_pass" >> "$TMP_CONF"; fi
@@ -361,9 +318,6 @@ TOML
     trap - EXIT INT TERM
     chmod 600 "$CONF"
     
-    # --------------------------------------------------------------------------
-    # Initialize Procd tracking for the binary
-    # --------------------------------------------------------------------------
     procd_open_instance
     procd_set_param command "$PROG" "$CONF"
     procd_set_param file "$CONF"
@@ -372,9 +326,6 @@ TOML
     procd_set_param respawn 3600 30 0
     procd_set_param limits nofile="65536 65536"
     
-    # --------------------------------------------------------------------------
-    # Dynamic Firewall Injection (RAM-only, removes on service stop)
-    # --------------------------------------------------------------------------
     if [ "$auto_fw" -eq 1 ]; then
         procd_open_data
         json_add_array firewall
@@ -397,5 +348,4 @@ stop_service() {
     killall -9 telemt 2>/dev/null
 }
 
-# Allow external services to trigger a reload (via ubus)
 service_triggers() { procd_add_reload_trigger "telemt"; }
