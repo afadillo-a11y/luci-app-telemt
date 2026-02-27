@@ -6,7 +6,7 @@
 [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
 
 echo "======================================================================"
-echo " Configuring luci-app-telemt v3.1.0-3 (PreLTS) "
+echo " Configuring luci-app-telemt v3.1.2 (PreLTS) "
 echo "======================================================================"
 
 echo "[*] Checking for running standalone telemt processes..."
@@ -48,4 +48,3 @@ rm -f /tmp/luci-indexcache
 echo "[*] Reloading RPCD..."
 /etc/init.d/rpcd reload 2>/dev/null || true
 exit 0
-
