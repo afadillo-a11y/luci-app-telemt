@@ -269,7 +269,10 @@ end
 -- UI FORM INITIALIZATION & TAB BINDINGS
 -- ==============================================================================
 m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.0-3 (PreLTS)</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
-m.on_commit = function(self) sys.call("logger -t telemt 'WebUI: Configuration changes saved and committed'") end
+m.on_commit = function(self) 
+    sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'")
+    sys.call("/etc/init.d/telemt run_save_stats 2>/dev/null")
+end
 
 s = m:section(NamedSection, "general", "telemt")
 s:tab("general", "General Settings")
