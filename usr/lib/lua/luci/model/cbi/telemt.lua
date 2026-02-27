@@ -1,12 +1,12 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.1.2 (PreLTS)
+-- Version: 3.1.2-2 (Golden Master with Strict OS Parsing)
 -- 
 -- Architecture:
 -- - Map: Connects to '/etc/config/telemt' and automatically handles I/O.
 -- - AJAX Endpoints: Intercepts POST/GET requests for live metrics, logs, and FW status.
 -- - DOM Mutation (Client-Side): Bulletproof OpenWrt 21-25 compatibility using 
---   Cell-Level Feature Detection. Strict ASCII Graceful Degradation for LuCI2 VDOM.
+--   /etc/openwrt_release OS version parsing to strictly isolate LuCI2 VDOM patches.
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -26,6 +26,18 @@ local function read_file(path)
     local d = f:read("*all") or ""
     f:close()
     return (d:gsub("%s+", ""))
+end
+
+-- ==============================================================================
+-- OS VERSION PARSER (Strict VDOM Guard)
+-- Detects if we are running OpenWrt 24.x, 25.x, or SNAPSHOT to apply LuCI2 hacks
+-- ==============================================================================
+local is_owrt25_lua = "false"
+local ow_rel = sys.exec("cat /etc/openwrt_release 2>/dev/null") or ""
+if ow_rel:match("DISTRIB_RELEASE='25") or ow_rel:match('DISTRIB_RELEASE="25') or 
+   ow_rel:match("DISTRIB_RELEASE='24") or ow_rel:match('DISTRIB_RELEASE="24') or 
+   ow_rel:match("SNAPSHOT") then
+    is_owrt25_lua = "true"
 end
 
 local _unpack = unpack or table.unpack
@@ -225,7 +237,7 @@ if not is_ajax then
     end
 end
 
-m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.2 (PreLTS)</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
+m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.2-2</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
 
 m.on_commit = function(self) 
     sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'")
@@ -313,7 +325,6 @@ local sp = s:taboption("general", Value, "socks_pass", "Password" .. tip("Option
 local hll = s:taboption("general", DummyValue, "_head_ll"); hll.rawhtml = true; hll.default = "<h3 style='margin-top:20px;'>Logging</h3>"
 local ll = s:taboption("general", ListValue, "log_level", "Log Level" .. tip("Verbosity of telemt daemon log output.")); ll:value("debug", "Debug"); ll:value("verbose", "Verbose"); ll:value("normal", "Normal (default)"); ll:value("silent", "Silent"); ll.default = "normal"
 
--- Advanced Tuning definitions...
 local hnet = s:taboption("advanced", DummyValue, "_head_net"); hnet.rawhtml = true; hnet.default = "<h3>Network Listeners</h3>"
 local lv4 = s:taboption("advanced", Flag, "listen_ipv4", "Enable IPv4 Listener" .. tip("Listen for incoming IPv4 connections on 0.0.0.0")); lv4.default = "1"
 local lv6 = s:taboption("advanced", Flag, "listen_ipv6", "Enable IPv6 Listener (::)" .. tip("Listen for incoming IPv6 connections on ::")); lv6.default = "0"
@@ -332,7 +343,6 @@ local deg_min_dc = s:taboption("advanced", Value, "degradation_min_dc", "Degrada
 local hadv = s:taboption("advanced", DummyValue, "_head_adv"); hadv.rawhtml = true; hadv.default = "<h3 style='margin-top:20px;'>Additional Options</h3>"
 local desync = s:taboption("advanced", Flag, "desync_all_full", "Full Crypto-Desync Logs" .. tip("Emit full forensic logs for every event. False = once per key window. Default: disabled (false).")); desync.default = "0"
 
--- v3.1.2 new feature: PROXY protocol to mask host
 local mpp = s:taboption("advanced", ListValue, "mask_proxy_protocol", "Mask Proxy Protocol" .. tip("Send PROXY protocol header to mask_host (if behind HAProxy/Nginx)."))
 mpp:value("0", "0 (Off)")
 mpp:value("1", "1 (v1 - Text)")
@@ -413,15 +423,38 @@ m.description = [[
 #cbi-telemt-user .cbi-row-template,
 #cbi-telemt-user [id*="-template"] { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; pointer-events: none !important; }
 
-/* Styling for the injected Name text (Used in both UI modes) */
-.telemt-user-col-text { font-weight: bold !important; color: #005ce6 !important; white-space: nowrap !important; }
-@media (prefers-color-scheme: dark) { .telemt-user-col-text { color: #4da6ff !important; } }
+/* Add User Button (Green Styling) */
+html body #cbi-telemt-user .cbi-button-add {
+    color: #00a000 !important;
+    -webkit-text-fill-color: #00a000 !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    border: 1px solid #00a000 !important;
+    opacity: 0.9 !important;
+    text-shadow: none !important;
+    transition: all 0.2s ease !important;
+    padding: 0 16px !important;
+    height: 32px !important;
+    line-height: 30px !important;
+    border-radius: 4px !important;
+    font-weight: bold !important;
+    box-shadow: none !important;
+}
+html body #cbi-telemt-user .cbi-button-add:hover,
+html body #cbi-telemt-user .cbi-button-add:focus,
+html body #cbi-telemt-user .cbi-button-add:active {
+    background-color: #00a000 !important;
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    opacity: 1 !important;
+    border-color: #00a000 !important;
+}
 
 /* Fix for native columns if they exist */
 #cbi-telemt-user .cbi-section-table td:first-child { vertical-align: middle !important; }
 @media screen and (max-width: 768px) { #cbi-telemt-user .cbi-section-table td:first-child { font-size: 1.1em !important; border-bottom: 1px solid var(--border-color, #ddd) !important; margin-bottom: 8px !important; padding-bottom: 8px !important; } }
 
-/* Standard UI Elements */
+/* Delete Buttons styling */
 html body #cbi-telemt-user .cbi-section-table .cbi-button-remove:not(.telemt-btn-cross), html body #cbi-telemt-user .cbi-section-table .cbi-button-del, html body #cbi-telemt-user .cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross), html body #cbi-telemt-user td.cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross) { color: #d9534f !important; -webkit-text-fill-color: #d9534f !important; background-color: transparent !important; background-image: none !important; border: 1px solid #d9534f !important; opacity: 0.8 !important; text-shadow: none !important; transition: all 0.2s ease !important; width: auto !important; min-width: 0 !important; display: inline-block !important; padding: 0 12px !important; height: 30px !important; line-height: 28px !important; box-sizing: border-box !important; margin: 0 !important; text-align: center !important; font-weight: normal !important; box-shadow: none !important; }
 html body #cbi-telemt-user .cbi-section-table .cbi-button-remove:not(.telemt-btn-cross):hover, html body #cbi-telemt-user .cbi-section-table .cbi-button-remove:not(.telemt-btn-cross):focus, html body #cbi-telemt-user .cbi-section-table .cbi-button-remove:not(.telemt-btn-cross):active, html body #cbi-telemt-user .cbi-section-table .cbi-button-del:hover, html body #cbi-telemt-user .cbi-section-table .cbi-button-del:focus, html body #cbi-telemt-user .cbi-section-table .cbi-button-del:active, html body #cbi-telemt-user .cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross):hover, html body #cbi-telemt-user td.cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross):hover { background-color: #d9534f !important; background-image: none !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; opacity: 1 !important; text-shadow: none !important; border-color: #d9534f !important; }
 
@@ -525,6 +558,7 @@ html body #cbi-telemt-user .cbi-section-table .cbi-button-remove:not(.telemt-btn
 // ==============================================================================
 
 var lu_current_url = "]] .. safe_url .. [[";
+var is_owrt25 = ]] .. is_owrt25_lua .. [[;
 
 function logAction(msg, data) { var ts = new Date().toISOString().split('T')[1].slice(0, -1); console.log("[Telemt UI | " + ts + "] " + msg, data ? data : ""); }
 function escHTML(s) { return String(s).replace(/[&<>'"]/g, function(c) { return '&#' + c.charCodeAt(0) + ';'; }); }
@@ -808,6 +842,19 @@ function isTemplateRow(row) {
 function injectUI() {
     fixTabIsolation();
     
+    // Gated native column rename (Only applies safely to OpenWrt 21-24)
+    if (!is_owrt25) {
+        var firstTh = document.querySelector('#cbi-telemt-user .cbi-section-table-titles th:first-child') || 
+                      document.querySelector('#cbi-telemt-user thead th:first-child');
+        if (firstTh && !firstTh.dataset.renamed) {
+            var txt = (firstTh.textContent || '').trim().toLowerCase();
+            if (txt === 'name' || txt === 'название' || txt === '') {
+                firstTh.textContent = 'User';
+                firstTh.dataset.renamed = "1";
+            }
+        }
+    }
+    
     var btnAdd = document.querySelector('.cbi-button-add'); if (btnAdd && btnAdd.value !== 'Add user') btnAdd.value = 'Add user';
     var newNameInp = document.querySelector('.cbi-section-create-name'); if(newNameInp && !newNameInp.dataset.maxInjected) { newNameInp.dataset.maxInjected = "1"; newNameInp.maxLength = 15; newNameInp.placeholder = "a-z, 0-9, _ (no dashes)"; }
     
@@ -836,11 +883,11 @@ function injectUI() {
         var uName = match ? match[1] : '?';
 
         // THE BULLETPROOF CHECK: 
-        // Look strictly inside the very first cell of the row.
-        // If the first cell contains our 'Secret' input, it means VDOM destroyed the Name column!
+        // Only trigger the blue name injection if the backend confirmed OpenWrt 25.x (LuCI2 VDOM)
+        // AND the DOM confirms the native column was destroyed.
         var firstCell = row.firstElementChild;
         var isFallbackMode = false;
-        if (firstCell && firstCell.contains(secInp)) {
+        if (is_owrt25 && firstCell && firstCell.contains(secInp)) {
             isFallbackMode = true;
         }
 
@@ -856,19 +903,8 @@ function injectUI() {
                 }
                 nameDiv.innerText = '[ user: ' + uName + ' ]'; 
             }
-        } else {
-            if (firstCell) {
-                var span = firstCell.querySelector('.telemt-user-col-text');
-                if (!span) {
-                    span = document.createElement('span');
-                    span.className = 'telemt-user-col-text';
-                    span.style.cssText = 'color: #005ce6 !important; font-weight: bold !important;';
-                    firstCell.innerHTML = '';
-                    firstCell.appendChild(span);
-                }
-                span.innerText = uName;
-            }
         }
+        // Notice: No 'else' block here. Older OpenWrt versions simply keep their native clean Name column.
         
         if(secInp) {
             if(secInp.value.trim() === "") { secInp.value = genRandHex(); secInp.dispatchEvent(new Event('change', {bubbles: true})); }
