@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.1.4-16 (Epoch 1) - EXACT 3.1.3 LOGS & RESET TO DEFAULTS
+-- Version: 3.1.4-17 (Epoch 1) - GOLDEN STABLE (EXACT 3.1.3 LOGS, DYNAMIC CASCADES)
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -60,7 +60,7 @@ if is_post and http.formvalue("auto_pause_user") then
 end
 
 if is_post and http.formvalue("reset_config") == "1" then
-    sys.call("logger -t telemt 'WebUI: RESET TO DEFAULTS'")
+    sys.call("logger -t telemt 'WebUI: FACTORY RESET ALL SETTINGS'")
     local default_uci = "config telemt 'general'\n\toption enabled '0'\n\toption mode 'tls'\n\toption domain 'google.com'\n\toption port '4443'\n\toption metrics_port '9091'\n\toption metrics_allow_lo '1'\n\toption metrics_allow_lan '1'\n\toption log_level 'normal'\n"
     local f = io.open("/etc/config/telemt", "w")
     if f then f:write(default_uci); f:close() end
@@ -207,7 +207,7 @@ if not is_ajax then
     else bin_info = string.format("<small style='opacity: 0.6;'>%s (v%s)</small>", bin_path, (read_file("/var/etc/telemt.version"):gsub("%s+", "")) == "" and "unknown" or (read_file("/var/etc/telemt.version"):gsub("%s+", ""))) end
 end
 
-m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.4-16</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
+m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.4-17</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
 m.on_commit = function(self) sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'; /etc/init.d/telemt run_save_stats 2>/dev/null") end
 
 s = m:section(NamedSection, "general", "telemt")
@@ -806,7 +806,7 @@ function injectUI() {
     var ipFlds = []; var m1 = document.querySelector('input[name*="cbid.telemt.general.external_ip"]'); if(m1) ipFlds.push(m1); var m2 = document.getElementById('telemt_mirror_ip'); if(m2) ipFlds.push(m2);
     ipFlds.forEach(function(ipFld) { if(!ipFld.dataset.refBtnInjected && ipFld.type !== "hidden") { ipFld.dataset.refBtnInjected = "1"; if(ipFld.parentNode) { ipFld.parentNode.style.display = 'flex'; ipFld.parentNode.style.alignItems = 'center'; var btn = document.createElement('input'); btn.type = 'button'; btn.className = 'cbi-button cbi-button-neural'; btn.value = 'Get IP'; btn.style.marginLeft = '5px'; btn.style.padding = '0 10px'; btn.style.height = ipFld.offsetHeight > 0 ? ipFld.offsetHeight + 'px' : '32px'; btn.addEventListener('click', function(){ fetchIPViaWget(this); }); ipFld.parentNode.appendChild(btn); } } });
 
-    // COLLAPSIBLE CASCADE CARDS & DYNAMIC TITLE
+    // COLLAPSIBLE CASCADE CARDS & DYNAMIC TITLE (Event Delegation approach)
     document.querySelectorAll('#cbi-telemt-upstream .cbi-section-node:not([id*="-template"])').forEach(function(row, index) {
         if (!row.dataset.cascadeInjected) {
             row.dataset.cascadeInjected = "1";
@@ -822,23 +822,24 @@ function injectUI() {
             header.appendChild(toggleSpan);
             row.insertBefore(header, row.firstChild);
             
-            var nameInput = row.querySelector('input[name*=".alias"]');
-            var addrInput = row.querySelector('input[name*=".address"]');
-            
             var updateTitle = function() {
-                var vName = (nameInput && nameInput.value.trim() !== "") ? nameInput.value.trim() : '';
-                var vAddr = (addrInput && addrInput.value.trim() !== "") ? addrInput.value.trim() : '';
+                var nInp = row.querySelector('input[name*=".alias"]');
+                var aInp = row.querySelector('input[name*=".address"]');
+                var vName = (nInp && nInp.value.trim() !== "") ? nInp.value.trim() : '';
+                var vAddr = (aInp && aInp.value.trim() !== "") ? aInp.value.trim() : '';
+                
                 var text = 'Cascade #' + (index + 1);
                 if (vName || vAddr) {
-                    text += ' — ' + (vName ? vName : 'Unnamed');
-                    if (vAddr) text += ' <span style="color:#888; font-weight:normal; font-size:0.9em;">(' + vAddr + ')</span>';
+                    text += ' — ' + escHTML(vName ? vName : 'Unnamed');
+                    if (vAddr) text += ' <span style="color:#888; font-weight:normal; font-size:0.9em;">(' + escHTML(vAddr) + ')</span>';
                 }
                 titleSpan.innerHTML = text;
             };
             
-            updateTitle();
-            if (nameInput) { nameInput.addEventListener('input', updateTitle); }
-            if (addrInput) { addrInput.addEventListener('input', updateTitle); }
+            setTimeout(updateTitle, 100);
+            row.addEventListener('input', function(e) {
+                if(e.target && e.target.tagName === 'INPUT') { updateTitle(); }
+            });
             
             var fields = Array.from(row.children).filter(function(child) { return child !== header && !child.classList.contains('cbi-section-remove'); });
             header.addEventListener('click', function(e) {
