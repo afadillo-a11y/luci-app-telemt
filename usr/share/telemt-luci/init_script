@@ -1,7 +1,7 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
 # Telemt MTProxy Service Management Script
-# Version: 3.1.4 (Epoch 1)
+# Version: 3.1.4-9 (Epoch 1) - STRICT UPSTREAM SAFETY
 # ==============================================================================
 START=99
 STOP=10
@@ -280,16 +280,21 @@ TOML
         config_get u_type "$s" type "direct"
         config_get u_weight "$s" weight "10"
         
+        # SAFETY FIX: Ignore SOCKS upstreams with empty addresses to prevent backend crash
+        if [ "$u_type" != "direct" ]; then
+            config_get u_addr "$s" address ""
+            if [ -z "$u_addr" ]; then return; fi
+        fi
+
         printf '\n[[upstreams]]\n' >> "$TMP_CONF"
         echo "type = \"$u_type\"" >> "$TMP_CONF"
         echo "weight = $u_weight" >> "$TMP_CONF"
         echo "enabled = true" >> "$TMP_CONF"
         
         if [ "$u_type" != "direct" ]; then
-            config_get u_addr "$s" address ""
             config_get u_user "$s" username ""
             config_get u_pass "$s" password ""
-            [ -n "$u_addr" ] && echo "address = \"$(sanitize_toml_value "$u_addr")\"" >> "$TMP_CONF"
+            echo "address = \"$(sanitize_toml_value "$u_addr")\"" >> "$TMP_CONF"
             [ -n "$u_user" ] && echo "username = \"$(sanitize_toml_value "$u_user")\"" >> "$TMP_CONF"
             [ -n "$u_pass" ] && echo "password = \"$(sanitize_toml_value "$u_pass")\"" >> "$TMP_CONF"
         fi
