@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.1.4-14 (Epoch 1) - AUTO-RESUME, SMART STATUSES, HARDCODED RESET
+-- Version: 3.1.4-15 (Epoch 1) - LOGREAD 3.1.3 RESTORED, DIAGNOSTICS DASHBOARD
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -127,7 +127,9 @@ if http.formvalue("get_scanners") == "1" then
 end
 
 if http.formvalue("get_log") == "1" then
-    local cmd = "logread | grep -i 'telemt' | tail -n 50 2>/dev/null"
+    -- СТРОГОЕ ВОЗВРАЩЕНИЕ К ЛОГИКЕ ИЗ 3.1.3
+    local cmd = "logread -e 'telemt' | tail -n 50 2>/dev/null"
+    if has_cmd("timeout") then cmd = "timeout 2 " .. cmd end
     local log_data = sys.exec(cmd); if not log_data or log_data:gsub("%s+", "") == "" then log_data = "No logs found." end
     http.prepare_content("text/plain")
     pcall(function() http.write(log_data:gsub("\27%[[%d;]*m", "")) end)
@@ -203,7 +205,7 @@ if not is_ajax then
     else bin_info = string.format("<small style='opacity: 0.6;'>%s (v%s)</small>", bin_path, (read_file("/var/etc/telemt.version"):gsub("%s+", "")) == "" and "unknown" or (read_file("/var/etc/telemt.version"):gsub("%s+", ""))) end
 end
 
-m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.4-14</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
+m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.4-15</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.0.15+</span>]])
 m.on_commit = function(self) sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'; /etc/init.d/telemt run_save_stats 2>/dev/null") end
 
 s = m:section(NamedSection, "general", "telemt")
@@ -321,7 +323,7 @@ local pref_ip = s:taboption("advanced", ListValue, "prefer_ip", "Preferred IP Pr
 
 local hme = s:taboption("advanced", DummyValue, "_head_me"); hme.rawhtml = true; hme.default = "<h3 style='margin-top:20px;'>Middle-End Proxy</h3>"
 local mp = s:taboption("advanced", Flag, "use_middle_proxy", "Use ME Proxy" .. tip("Allows Media/CDN (DC=203) to work correctly.")); mp.default = "0"; mp.description = "<span style='color:#d35400; font-weight:bold;'>Requires public IP on interface OR NAT 1:1 with STUN enabled.</span>"
-local stun = s:taboption("advanced", Flag, "use_stun", "Enable STUN-probing" .. tip("Leave enabled if your server is behind NAT. Required for ME proxy on standard setups.")); stun:depends("use_middle_proxy", "1"); stun.default = "1"
+local stun = s:taboption("advanced", Flag, "use_stun", "Enable STUN-probing" .. tip("Leave enabled if your server is behind NAT. Required for ME proxy on standard setups.")); stun:depends("use_middle_proxy", "1"); stun.default = "0"
 s:taboption("advanced", Value, "me_pool_size", "ME Pool Size" .. tip("Desired number of concurrent ME writers in pool. Default: 16.")):depends("use_middle_proxy", "1")
 s:taboption("advanced", Value, "me_warm_standby", "ME Warm Standby" .. tip("Pre-initialized warm-standby ME connections kept idle. Default: 8.")):depends("use_middle_proxy", "1")
 s:taboption("advanced", Flag, "hardswap", "ME Pool Hardswap" .. tip("Enable C-like hard-swap for ME pool generations.")):depends("use_middle_proxy", "1")
@@ -364,7 +366,53 @@ local bc = s:taboption("bot", Value, "bot_chat_id", "Admin Chat ID" .. tip("Your
 
 -- === TAB: DIAGNOSTICS ===
 local lv = s:taboption("log", DummyValue, "_lv"); lv.rawhtml = true
-lv.default = [[<div style="width:100%; box-sizing:border-box; height:500px; font-family:monospace; font-size:12px; padding:12px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #333; border-radius: 4px; overflow-y:auto; overflow-x:auto; white-space:pre;" id="telemt_log_container">Click a button below to load data.</div><div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;"><input type="button" class="cbi-button cbi-button-apply" id="btn_load_log" value="System Log" /><input type="button" class="cbi-button cbi-button-reset" id="btn_load_scanners" value="Show Active Scanners" /><input type="button" class="cbi-button cbi-button-action" id="btn_copy_log" value="Copy Output" /><input type="button" class="cbi-button cbi-button-neural" id="btn_export_config" value="Export active config" style="background:#4a90e2; color:#fff; border:1px solid #357abd;" /><input type="button" class="cbi-button cbi-button-remove" id="btn_reset_config" value="Reset Config" /></div><script>setTimeout(function(){ document.getElementById('btn_load_log').addEventListener('click', loadLog); document.getElementById('btn_load_scanners').addEventListener('click', loadScanners); document.getElementById('btn_copy_log').addEventListener('click', function(){ copyLogContent(this); }); document.getElementById('btn_export_config').addEventListener('click', function() { var fd = new FormData(); fd.append('export_config', '1'); var tok = null; var tn = document.querySelector('input[name="token"]'); if (tn) tok = tn.value; else if (typeof L !== 'undefined' && L.env) tok = L.env.token || L.env.requesttoken || null; if (!tok) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tok = cm[1]; } if (tok) fd.append('token', tok); fetch(lu_current_url.split('#')[0], {method: 'POST', body: fd}).then(r => r.text()).then(txt => { txt = cleanResponse(txt); var blob = new Blob([txt], {type: 'application/toml'}); var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'telemt.toml'; document.body.appendChild(a); a.click(); document.body.removeChild(a); }); }); document.getElementById('btn_reset_config').addEventListener('click', function() { if(confirm('Are you sure you want to RESET ALL Telemt settings to defaults? This will erase all users and cascades!')) { var fd = new FormData(); fd.append('reset_config', '1'); var tok = null; var tn = document.querySelector('input[name="token"]'); if (tn) tok = tn.value; else if (typeof L !== 'undefined' && L.env) tok = L.env.token || L.env.requesttoken || null; if (!tok) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tok = cm[1]; } if (tok) fd.append('token', tok); fetch(lu_current_url.split('#')[0], {method: 'POST', body: fd}).then(() => { window.location.reload(); }); } }); }, 500);</script>]]
+lv.default = [[
+<div class="telemt-dash-top-row" style="margin-bottom:15px; padding:12px; background:rgba(128,128,128,0.05); border:1px solid var(--border-color, rgba(128,128,128,0.2)); border-radius:6px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+    <div style="font-weight:bold; font-size:1.05em; color:var(--text-color, #555);">Diagnostics & Maintenance</div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <input type="button" class="cbi-button cbi-button-action" id="btn_export_config" value="Export Active Config" style="background:#4a90e2; color:#fff; border:1px solid #357abd;" />
+        <input type="button" class="cbi-button cbi-button-remove" id="btn_reset_config" value="Factory Reset" />
+    </div>
+</div>
+<div style="width:100%; box-sizing:border-box; height:500px; font-family:monospace; font-size:12px; padding:12px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #333; border-radius: 4px; overflow-y:auto; overflow-x:auto; white-space:pre;" id="telemt_log_container">Click a button below to load data.</div>
+<div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+    <input type="button" class="cbi-button cbi-button-apply" id="btn_load_log" value="System Log" />
+    <input type="button" class="cbi-button cbi-button-reset" id="btn_load_scanners" value="Show Active Scanners" />
+    <input type="button" class="cbi-button cbi-button-action" id="btn_copy_log" value="Copy Output" />
+</div>
+<script>
+setTimeout(function(){
+    document.getElementById('btn_load_log').addEventListener('click', loadLog);
+    document.getElementById('btn_load_scanners').addEventListener('click', loadScanners);
+    document.getElementById('btn_copy_log').addEventListener('click', function(){ copyLogContent(this); });
+    
+    document.getElementById('btn_export_config').addEventListener('click', function() {
+        var fd = new FormData(); fd.append('export_config', '1');
+        var tok = null; var tn = document.querySelector('input[name="token"]');
+        if (tn) tok = tn.value; else if (typeof L !== 'undefined' && L.env) tok = L.env.token || L.env.requesttoken || null;
+        if (!tok) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tok = cm[1]; }
+        if (tok) fd.append('token', tok);
+        fetch(lu_current_url.split('#')[0], {method: 'POST', body: fd}).then(r => r.text()).then(txt => {
+            txt = cleanResponse(txt);
+            var blob = new Blob([txt], {type: 'application/toml'});
+            var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'telemt.toml';
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        });
+    });
+    
+    document.getElementById('btn_reset_config').addEventListener('click', function() {
+        if(confirm('Are you sure you want to FACTORY RESET ALL Telemt settings? This will completely erase all users, cascades, and custom settings!')) {
+            var fd = new FormData(); fd.append('reset_config', '1');
+            var tok = null; var tn = document.querySelector('input[name="token"]');
+            if (tn) tok = tn.value; else if (typeof L !== 'undefined' && L.env) tok = L.env.token || L.env.requesttoken || null;
+            if (!tok) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tok = cm[1]; }
+            if (tok) fd.append('token', tok);
+            fetch(lu_current_url.split('#')[0], {method: 'POST', body: fd}).then(() => { window.location.reload(); });
+        }
+    });
+}, 500);
+</script>
+]]
 
 -- === TAB: USERS ===
 local anchor = s:taboption("users", DummyValue, "_users_anchor", ""); anchor.rawhtml = true; anchor.default = '<div id="users_tab_anchor" style="display:none"></div>'
@@ -859,7 +907,6 @@ function injectUI() {
             var propName = ni.name.match(/([^\.]+)$/); var fName = propName ? propName[1] : "limit";
             ni.addEventListener('change', function(e) { 
                 logToRouter("User " + uName + " " + fName + " changed to: " + (e.target.value || "unlimited")); 
-                // AUTO-RESUME LOGIC
                 if (fName === 'expire_date' || fName === 'data_quota') {
                     if (cb && !cb.checked) {
                         cb.checked = true;
