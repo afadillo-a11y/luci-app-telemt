@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.1.4-5 (Epoch 1) - UCODE PROOF & UPSTREAM NUMBERS
+-- Version: 3.1.4-6 (Epoch 1) - JS FIXED & UCODE PROOF
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -36,7 +36,7 @@ local function raw_reply(data, content_type)
     http.prepare_content(content_type or "text/plain")
     http.write(data)
     if io.stdout.close then io.stdout:close() end
-    os.exit(0) -- Брутальное завершение процесса для предотвращения 500 ошибки на ucodebridge
+    os.exit(0)
 end
 
 local function clean_redirect(url)
@@ -171,7 +171,7 @@ if not is_ajax then
     else bin_info = string.format("<small style='opacity: 0.6;'>%s (v%s)</small>", bin_path, read_file("/var/etc/telemt.version") == "" and "unknown" or read_file("/var/etc/telemt.version")) end
 end
 
-m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.4-5</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.1.3+</span>]])
+m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.1.4-6</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.1.3+</span>]])
 m.on_commit = function(self) sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'; /etc/init.d/telemt run_save_stats 2>/dev/null") end
 
 s = m:section(NamedSection, "general", "telemt")
@@ -644,7 +644,7 @@ function injectUI() {
     var ipFlds = []; var m1 = document.querySelector('input[name*="cbid.telemt.general.external_ip"]'); if(m1) ipFlds.push(m1); var m2 = document.getElementById('telemt_mirror_ip'); if(m2) ipFlds.push(m2);
     ipFlds.forEach(function(ipFld) { if(!ipFld.dataset.refBtnInjected && ipFld.type !== "hidden") { ipFld.dataset.refBtnInjected = "1"; if(ipFld.parentNode) { ipFld.parentNode.style.display = 'flex'; ipFld.parentNode.style.alignItems = 'center'; var btn = document.createElement('input'); btn.type = 'button'; btn.className = 'cbi-button cbi-button-neural'; btn.value = 'Get IP'; btn.style.marginLeft = '5px'; btn.style.padding = '0 10px'; btn.style.height = ipFld.offsetHeight > 0 ? ipFld.offsetHeight + 'px' : '32px'; btn.addEventListener('click', function(){ fetchIPViaWget(this); }); ipFld.parentNode.appendChild(btn); } } });
 
-    -- INJECT CASCADE NUMBERS
+    // INJECT CASCADE NUMBERS
     document.querySelectorAll('#cbi-telemt-upstream .cbi-section-node:not([id*="-template"]), #cbi-telemt-upstream .cbi-section-table-row:not(.cbi-row-template)').forEach(function(row, index) {
         if (!row.dataset.cascadeInjected) {
             row.dataset.cascadeInjected = "1";
