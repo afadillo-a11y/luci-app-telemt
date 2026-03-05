@@ -1,0 +1,9 @@
+#!/bin/sh
+# ==============================================================================
+# Pre-Removal Script
+# Stops the daemon and removes it from the autostart sequence before deletion.
+# ==============================================================================
+echo "[*] Stopping telemt core service..."
+/etc/init.d/telemt disable 2>/dev/null || true
+/etc/init.d/telemt stop 2>/dev/null || true
+exit 0
