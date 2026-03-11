@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.3.15 LTS (Monolithic CSR, Deep ME Tuning, Unified API, RAM Cache)
+-- Version: 3.3.15-6 LTS (Monolithic CSR, Deep ME Tuning, Unified API, RAM Cache)
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -332,11 +332,23 @@ local uen = s_up:option(Flag, "enabled", "Active"); uen.default = "1"; uen.rmemp
 local ut = s_up:option(ListValue, "type", "Protocol")
 ut:value("direct", "Direct"); ut:value("socks4", "SOCKS4"); ut:value("socks5", "SOCKS5"); ut.default = "socks5"
 
-local ua = s_up:option(Value, "address", "Address" .. tip("Format: IP:PORT or HOST:PORT. No hyphens allowed."))
+local ua = s_up:option(Value, "address", "Address" .. tip("Format: IP:PORT or HOST:PORT."))
 ua.datatype = "hostport"; ua:depends("type", "socks4"); ua:depends("type", "socks5")
-function ua.validate(self, v) if v and v ~= "" and not v:match("^[A-Za-z0-9%.%:]+$") then return nil, "Invalid characters! No hyphens allowed." end return v end
+function ua.validate(self, v) 
+    if v and v ~= "" and not v:match("^[A-Za-z0-9%.%:%-]+$") then 
+        return nil, "Invalid characters! Only Latin letters, numbers, dots, colons, and hyphens allowed." 
+    end 
+    return v 
+end
 
-local uint = s_up:option(Value, "interface", "Interface / Bind IP" .. tip("Optional. Bind outgoing traffic to specific local IP.")); uint:depends("type", "direct")
+local uint = s_up:option(Value, "interface", "Interface / Bind IP" .. tip("Optional. Bind outgoing traffic to specific local IP."))
+uint:depends("type", "direct")
+function uint.validate(self, v) 
+    if v and v ~= "" and not v:match("^[A-Za-z0-9%.%:%-%_]+$") then 
+        return nil, "Invalid characters! Use valid IP or interface name." 
+    end 
+    return v 
+end
 
 local uu = s_up:option(Value, "username", "Username" .. tip("Optional. Latin letters and numbers only, no hyphens."))
 uu:depends("type", "socks5")
