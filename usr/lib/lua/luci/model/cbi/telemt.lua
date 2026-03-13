@@ -371,6 +371,12 @@ myip.datatype = "string"; myip.default = saved_ip; myip.validate = validate_ip_d
 
 local p = s:taboption("general", Value, "port", "MTProxy Port" .. tip("The port on which the MTProxy server will listen for connections.")); p.datatype = "port"; p.rmempty = false; p.default = "8443"
 
+-- PATCH 3.3.16: External port for tg:// links — critical under NAT with port-mapping
+-- Example: router listens on :8443 internally, ISP maps it to :443 externally.
+local pp = s:taboption("general", Value, "public_port",
+    "External Port (for links)" .. tip("Port shown in tg://proxy links. Leave empty = same as Proxy Port. Set when behind NAT with port-mapping (e.g. router :8443 \226\134\146 ISP :443)."))
+pp.datatype = "port"; pp.placeholder = "same as Proxy Port"; pp.rmempty = true
+
 local afw = s:taboption("general", Flag, "auto_fw", "Auto-open Port (Magic)" .. tip("Uses procd API to open port in RAM. Rule will not appear in Firewall menu. Closes automatically if proxy stops."))
 afw.default = "0"; afw.description = "<div style='margin-top:5px; padding:8px; background:rgba(128,128,128,0.1); border-left:3px solid #00a000; font-size:0.9em;'><b>Current Status:</b> <span id='fw_status_span' style='color:#888; font-style:italic;'>Checking...</span></div>"
 
@@ -426,20 +432,18 @@ local mp = s:taboption("advanced", Flag, "use_middle_proxy", "Use ME Proxy" .. t
 local stun = s:taboption("advanced", Flag, "use_stun", "Enable STUN-probing" .. tip("Leave enabled if your server is behind NAT. Required for ME proxy on standard setups.")); stun:depends("use_middle_proxy", "1"); stun.default = "0"
 local meps = s:taboption("advanced", Value, "me_pool_size", "ME Pool Size" .. tip("Desired number of concurrent ME writers in pool. Default: 16.")); meps.datatype = "uinteger"; meps:depends("use_middle_proxy", "1")
 
-local h_me_adv = s:taboption("advanced", DummyValue, "_head_me_adv")
-h_me_adv.rawhtml = true
-h_me_adv.default = [[<div style="display:block; width:100%;"><details id="telemt_me_opts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:15px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;"><summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer; color:inherit;">Deep ME Tuning (Click to expand)</summary><p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Advanced Adaptive Pool and Recovery parameters. Edit only if you understand the runtime model.</p></details></div>]]
-h_me_adv:depends("use_middle_proxy", "1")
+-- PATCH 3.3.16: Removed h_me_adv spoiler wrapper.
+-- The <details> container was hiding a mix of real and phantom fields.
+-- Real fields now appear directly via :depends() — no spoiler needed.
 
-local fmode = s:taboption("advanced", ListValue, "me_floor_mode", "ME Floor Mode" .. tip("Static maintains fixed pool, Adaptive shrinks pool during idle.")); fmode:value("static", "Static (Fixed)"); fmode:value("adaptive", "Adaptive (Dynamic)"); fmode.default = "static"; fmode:depends("use_middle_proxy", "1")
-local maid = s:taboption("advanced", Value, "me_adaptive_floor_idle_secs", "Adaptive Idle (sec)" .. tip("Time without traffic before shrinking. Default: 600.")); maid.datatype = "uinteger"; maid:depends({use_middle_proxy="1", me_floor_mode="adaptive"})
-local magr = s:taboption("advanced", Value, "me_adaptive_floor_recover_grace_secs", "Adaptive Grace (sec)" .. tip("Grace period preventing pool flapping. Default: 120.")); magr.datatype = "uinteger"; magr:depends({use_middle_proxy="1", me_floor_mode="adaptive"})
-local mamw = s:taboption("advanced", Value, "me_adaptive_floor_min_writers_single_endpoint", "Adaptive Min Writers" .. tip("Minimum writers to keep alive during deep idle. Default: 1.")); mamw.datatype = "uinteger"; mamw:depends({use_middle_proxy="1", me_floor_mode="adaptive"})
-local mwsb = s:taboption("advanced", Value, "me_warm_standby", "ME Warm Standby" .. tip("Pre-initialized connections kept idle. Default: 8.")); mwsb.datatype = "uinteger"; mwsb:depends("use_middle_proxy", "1")
-local mse_sw = s:taboption("advanced", Value, "me_single_endpoint_shadow_writers", "Shadow Writers" .. tip("Hidden backup connections for fragile DCs. Default: 2.")); mse_sw.datatype = "uinteger"; mse_sw:depends("use_middle_proxy", "1")
-local outm = s:taboption("advanced", Flag, "me_single_endpoint_outage_mode_enabled", "Outage Recovery Mode" .. tip("Aggressive reconnect loop if all writers die.")); outm.default = "1"; outm:depends("use_middle_proxy", "1")
-s:taboption("advanced", Flag, "me_single_endpoint_outage_disable_quarantine", "Bypass Quarantine" .. tip("Ignore reconnect delays during an outage to restore fast.")):depends({use_middle_proxy="1", me_single_endpoint_outage_mode_enabled="1"})
-local mse_sr = s:taboption("advanced", Value, "me_single_endpoint_shadow_rotate_every_secs", "Shadow Rotate (sec)" .. tip("Period to refresh idle shadow writers. Default: 900.")); mse_sr.datatype = "uinteger"; mse_sr:depends("use_middle_proxy", "1")
+-- PATCH 3.3.16: Removed 8 phantom taboption fields. These were silently ignored
+-- by the Rust TOML parser — binary v3.3.16+ self-tunes them as read-only state:
+--   me_floor_mode, me_adaptive_floor_idle_secs, me_adaptive_floor_recover_grace_secs,
+--   me_adaptive_floor_min_writers_single_endpoint, me_single_endpoint_shadow_writers,
+--   me_single_endpoint_outage_mode_enabled, me_single_endpoint_outage_disable_quarantine,
+--   me_single_endpoint_shadow_rotate_every_secs
+-- Real ME controls below (all kept):
+local mwsb = s:taboption("advanced", Value, "me_warm_standby", "ME Warm Standby" .. tip("Pre-initialized connections kept idle as reserve. Default: 8.")); mwsb.datatype = "uinteger"; mwsb:depends("use_middle_proxy", "1")
 s:taboption("advanced", Flag, "hardswap", "ME Pool Hardswap" .. tip("Enable C-like hard-swap for ME pool generations.")):depends("use_middle_proxy", "1")
 local mdt = s:taboption("advanced", Value, "me_drain_ttl", "ME Drain TTL (sec)" .. tip("Drain-TTL in seconds for stale ME writers. Default: 90.")); mdt.datatype = "uinteger"; mdt:depends("use_middle_proxy", "1")
 local adeg = s:taboption("advanced", Flag, "auto_degradation", "Auto-Degradation (Fallback)" .. tip("Enable auto-degradation from ME to Direct-DC if ME fails. Default: enabled.")); adeg.default = "1"; adeg:depends("use_middle_proxy", "1")
@@ -671,7 +675,9 @@ var repackTimer = null;
 function repackAllSpoilers() {
     isRepacking = true;
     var spoilerMaps = {
-        'telemt_me_opts_details': ['me_floor_mode', 'me_adaptive_floor_idle_secs', 'me_adaptive_floor_recover_grace_secs', 'me_adaptive_floor_min_writers_single_endpoint', 'me_warm_standby', 'me_single_endpoint_shadow_writers', 'me_single_endpoint_outage_mode_enabled', 'me_single_endpoint_outage_disable_quarantine', 'me_single_endpoint_shadow_rotate_every_secs', 'hardswap', 'me_drain_ttl', 'auto_degradation', 'degradation_min_dc'],
+        // PATCH 3.3.16: telemt_me_opts_details spoiler removed — fields now visible directly.
+        // Kept in map only: real fields that still exist. Phantom fields removed from map.
+        // (empty entry retained so spoilerMaps structure is valid)
         'telemt_adv_opts_details': ['desync_all_full', 'mask_proxy_protocol', 'announce_ip', 'ad_tag', 'fake_cert_len', 'tls_full_cert_ttl_secs', 'ignore_time_skew'],
         'telemt_timeouts_details': ['tm_handshake', 'tm_connect', 'tm_keepalive', 'tm_ack', 'replay_window_secs']
     };
@@ -694,7 +700,8 @@ function scheduleRepack() {
 }
 
 document.addEventListener('change', function(e) {
-    if (e.target && (e.target.name && (e.target.name.indexOf('use_middle_proxy') > -1 || e.target.name.indexOf('me_floor_mode') > -1 || e.target.name.indexOf('auto_degradation') > -1))) {
+    // PATCH 3.3.16: removed me_floor_mode from trigger (field deleted)
+    if (e.target && (e.target.name && (e.target.name.indexOf('use_middle_proxy') > -1 || e.target.name.indexOf('auto_degradation') > -1))) {
         scheduleRepack();
     }
 });
@@ -984,6 +991,9 @@ function getEffectiveIP() { var m1 = document.querySelector('input[name*="cbid.t
 function updateLinks() {
     var d = document.querySelector('input[name*="domain"]'); var p = document.querySelector('input[name*="port"]'); var modeSelect = document.querySelector('select[name*="mode"]'); var fmtSelect = document.querySelector('select[name*="_link_fmt"]');
     var ip = getEffectiveIP(); var port = p ? p.value.trim() : "8443"; var domain = d ? d.value.trim() : ""; var mode = modeSelect ? modeSelect.value : "tls";
+    // PATCH 3.3.16: public_port overrides port in tg:// links (critical for NAT port-mapping)
+    var ppField = document.querySelector('input[name*="cbid.telemt.general.public_port"]');
+    if (ppField && ppField.value.trim() !== "") { port = ppField.value.trim(); }
     var effectiveFmt = mode; if (mode === 'all' && fmtSelect) effectiveFmt = fmtSelect.value;
     if(!ip || !port) return;
     var hd = ""; if (domain && (effectiveFmt === 'tls' || effectiveFmt === 'all')) { for(var n=0; n<domain.length; n++) { var hex = domain.charCodeAt(n).toString(16); if (hex.length < 2) hex = "0" + hex; hd += hex; } }
