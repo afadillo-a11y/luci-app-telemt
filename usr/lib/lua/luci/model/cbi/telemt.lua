@@ -1,12 +1,6 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.3.16-10 (Strict Types, Zero-Cost Dashboard, Debounce Repack)
--- ==============================================================================
--- DEVELOPER NOTES:
--- 1. Dashboard relies on zero-cost native Lua io.open for /proc reads.
--- 2. Repacking mechanism for <details> spoilers uses a strict debounce timer 
---    and an 'isRepacking' lock flag to prevent MutationObserver infinite loops.
--- 3. Strict ASCII formatting for all UI elements to avoid embedded server encoding issues.
+-- Version: 3.3.16-11 (Security & Deep Architecture Audit Fixes Applied)
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -14,7 +8,6 @@ local http = require "luci.http"
 local dsp = require "luci.dispatcher"
 local uci_cursor = require("luci.model.uci").cursor()
 
--- Universal AJAX kill switch
 local function end_ajax()
     pcall(function() if dsp.context then dsp.context.dispatched = true end end)
     pcall(function() http.close() end)
@@ -28,6 +21,29 @@ local function read_file(path)
     local d = f:read("*all") or ""; f:close(); return d
 end
 
+local function http_get_local(url, timeout)
+    timeout = tonumber(timeout) or 2
+    local res = ""
+    if fetch_bin == "wget" then
+        res = sys.exec(string.format("wget -q -T %d -O - %q 2>/dev/null", timeout, url)) or ""
+    elseif fetch_bin == "uclient-fetch" then
+        res = sys.exec(string.format("uclient-fetch -q -T %d -O - %q 2>/dev/null", timeout, url)) or ""
+    end
+    -- Fallback safety: do not return HTML errors meant for JSON/Prometheus parsers
+    if res:sub(1,1) == "<" then return "" end
+    return res
+end
+
+local function cmp_ver(a, b)
+    local a1, a2, a3 = a:match("^(%d+)%.(%d+)%.(%d+)")
+    local b1, b2, b3 = b:match("^(%d+)%.(%d+)%.(%d+)")
+    if not a1 then return -1 end
+    if not b1 then return 1 end
+    if tonumber(a1) ~= tonumber(b1) then return tonumber(a1) - tonumber(b1) end
+    if tonumber(a2) ~= tonumber(b2) then return tonumber(a2) - tonumber(b2) end
+    return tonumber(a3) - tonumber(b3)
+end
+
 local is_owrt25_lua = "false"
 local ow_rel = sys.exec("cat /etc/openwrt_release 2>/dev/null") or ""
 if ow_rel:match("DISTRIB_RELEASE='25") or ow_rel:match('DISTRIB_RELEASE="25') or ow_rel:match("SNAPSHOT") or ow_rel:match("%-rc") then is_owrt25_lua = "true" end
@@ -36,6 +52,7 @@ local _unpack = unpack or table.unpack
 local _ok_url, current_url = pcall(function() if dsp.context and dsp.context.request then return dsp.build_url(_unpack(dsp.context.request)) end return nil end)
 if not _ok_url or not current_url or current_url == "" then current_url = dsp.build_url("admin", "services", "telemt") end
 local safe_url = current_url:gsub('"', '\\"'):gsub('<', '&lt;'):gsub('>', '&gt;')
+local qs_char = current_url:find("?", 1, true) and "&" or "?"
 
 local function tip(txt) return string.format([[<span class="telemt-tip" title="%s">(?)</span>]], txt:gsub('"', '&quot;')) end
 local is_ajax = (http.getenv("REQUEST_METHOD") == "POST" or http.formvalue("get_metrics") or http.formvalue("get_fw_status") or http.formvalue("get_scanners") or http.formvalue("get_log") or http.formvalue("get_wan_ip") or http.formvalue("get_qr") or http.formvalue("telemt_action"))
@@ -48,55 +65,49 @@ local is_post = (http.getenv("REQUEST_METHOD") == "POST")
 if is_post and http.formvalue("log_ui_event") == "1" then
     local msg = http.formvalue("msg")
     if msg then sys.call(string.format("logger -t telemt %q", "WebUI: " .. msg:gsub("[%c]", " "):gsub("[^A-Za-z0-9 _.%-%:]", ""):sub(1, 128))) end
-    http.prepare_content("text/plain")
-    pcall(function() http.write("ok") end)
-    end_ajax(); return
+    http.prepare_content("text/plain"); pcall(function() http.write("ok") end); end_ajax(); return
 end
 
 if is_post and http.formvalue("telemt_action") then
     local act = http.formvalue("telemt_action")
-    if act == "start" then sys.call("logger -t telemt 'WebUI: Manual START'; /etc/init.d/telemt start")
-    elseif act == "stop" then sys.call("logger -t telemt 'WebUI: Manual STOP'; /etc/init.d/telemt run_save_stats; /etc/init.d/telemt stop; sleep 1; killall -9 telemt 2>/dev/null")
-    elseif act == "restart" then sys.call("logger -t telemt 'WebUI: Manual RESTART'; /etc/init.d/telemt run_save_stats; /etc/init.d/telemt stop; sleep 1; killall -9 telemt 2>/dev/null; /etc/init.d/telemt start")
+    if act == "start" then sys.call("logger -t telemt 'WebUI: Manual START'; /etc/init.d/telemt start >/dev/null 2>&1 &")
+    elseif act == "stop" then sys.call("logger -t telemt 'WebUI: Manual STOP'; /etc/init.d/telemt stop >/dev/null 2>&1 &")
+    elseif act == "restart" then sys.call("logger -t telemt 'WebUI: Manual RESTART'; /etc/init.d/telemt restart >/dev/null 2>&1 &")
     elseif act == "reset_stats" then sys.call("logger -t telemt 'WebUI: Reset Stats'; rm -f /tmp/telemt_stats.txt")
     end
-    http.prepare_content("text/plain")
-    pcall(function() http.write("ok") end)
-    end_ajax(); return
+    http.prepare_content("text/plain"); pcall(function() http.write("ok") end); end_ajax(); return
 end
 
+-- RCE VULNERABILITY FIX: Strict validation of username before shell execution
 if is_post and http.formvalue("auto_pause_user") then
     local u = http.formvalue("auto_pause_user"); local reason = http.formvalue("reason") or "Limit Exceeded"
-    if u and u ~= "" then
-        uci_cursor:set("telemt", u, "enabled", "0")
-        uci_cursor:save("telemt"); uci_cursor:commit("telemt")
-        sys.call(string.format("logger -t telemt 'WebUI: Auto-paused user %s (Reason: %s)'", u, reason))
+    if u and u:match("^[A-Za-z0-9_]+$") then
+        uci_cursor:set("telemt", u, "enabled", "0"); uci_cursor:save("telemt"); uci_cursor:commit("telemt")
+        sys.call(string.format("logger -t telemt 'WebUI: Auto-paused user %q (Reason: %q)'", u, reason))
         sys.call("/etc/init.d/telemt reload >/dev/null 2>&1 &")
     end
-    http.prepare_content("text/plain")
-    pcall(function() http.write("ok") end)
-    end_ajax(); return
+    http.prepare_content("text/plain"); pcall(function() http.write("ok") end); end_ajax(); return
 end
 
+-- ATOMIC WRITE FIX: Write default config to tmp then atomic move to prevent 0-byte corruptions
 if is_post and http.formvalue("reset_config") == "1" then
     sys.call("logger -t telemt 'WebUI: FACTORY RESET ALL SETTINGS'")
     local default_uci = "config telemt 'general'\n\toption enabled '0'\n\toption mode 'tls'\n\toption domain 'google.com'\n\toption port '8443'\n\toption metrics_port '9092'\n\toption api_port '9091'\n\toption extended_runtime_enabled '1'\n\toption metrics_allow_lo '1'\n\toption metrics_allow_lan '1'\n\toption log_level 'normal'\n"
-    local f = io.open("/etc/config/telemt", "w")
-    if f then f:write(default_uci); f:close() end
-    sys.call("rm -f /var/etc/telemt.toml")
-    sys.call("/etc/init.d/telemt stop 2>/dev/null")
-    http.prepare_content("text/plain")
-    pcall(function() http.write("ok") end)
-    end_ajax(); return
+    local f = io.open("/tmp/telemt_reset.tmp", "w")
+    if f then 
+        f:write(default_uci); f:close()
+        os.rename("/tmp/telemt_reset.tmp", "/etc/config/telemt")
+    end
+    sys.call("rm -f /tmp/etc/telemt.toml /var/etc/telemt.toml"); sys.call("/etc/init.d/telemt stop 2>/dev/null")
+    http.prepare_content("text/plain"); pcall(function() http.write("ok") end); end_ajax(); return
 end
 
 if is_post and http.formvalue("export_config") == "1" then
-    local conf = read_file("/var/etc/telemt.toml")
+    local conf = read_file("/tmp/etc/telemt.toml")
     if conf == "" then conf = "# telemt.toml not found or empty\n" end
     http.prepare_content("application/toml")
     http.header("Content-Disposition", "attachment; filename=\"telemt.toml\"")
-    pcall(function() http.write(conf) end)
-    end_ajax(); return
+    pcall(function() http.write(conf) end); end_ajax(); return
 end
 
 if http.formvalue("get_fw_status") == "1" then
@@ -109,8 +120,7 @@ if http.formvalue("get_fw_status") == "1" then
     
     local pid = ""
     for p in (sys.exec("pidof telemt 2>/dev/null") or ""):gmatch("%d+") do
-        local comm = (sys.exec("cat /proc/" .. p .. "/comm 2>/dev/null") or ""):gsub("%s+", "")
-        if comm == "telemt" then pid = p; break end
+        if (sys.exec("cat /proc/" .. p .. "/comm 2>/dev/null") or ""):gsub("%s+", "") == "telemt" then pid = p; break end
     end
     local is_running = (pid ~= "")
 
@@ -120,101 +130,97 @@ if http.formvalue("get_fw_status") == "1" then
     
     if not is_running then status_msg = "<span style='color:#d9534f; font-weight:bold'>SERVICE STOPPED</span> <span style='color:#888'>|</span> " .. status_msg end
     
-    http.prepare_content("text/plain")
-    pcall(function() http.write(status_msg .. (tip_msg ~= "" and " <span style='color:#888; font-size:0.85em; margin-left:5px;'>" .. tip_msg .. "</span>" or "")) end)
-    end_ajax(); return
+    http.prepare_content("text/plain"); pcall(function() http.write(status_msg .. (tip_msg ~= "" and " <span style='color:#888; font-size:0.85em; margin-left:5px;'>" .. tip_msg .. "</span>" or "")) end); end_ajax(); return
 end
 
 -- ==============================================================================
--- ZERO-COST METRICS & OS MEMORY POLLING (GRACEFUL DEGRADATION)
+-- ZERO-COST MULTIPLEXED METRICS & API POLLING
 -- ==============================================================================
 if http.formvalue("get_metrics") == "1" then
     local m_port = tonumber(uci_cursor:get("telemt", "general", "metrics_port")) or 9092
-    local metrics = ""
+    local api_port = tonumber(uci_cursor:get("telemt", "general", "api_port")) or 9091
+    local ext_rt = uci_cursor:get("telemt", "general", "extended_runtime_enabled") or "1"
     
-    -- 1. Read System RAM using native I/O (No sys.exec overhead)
+    local metrics = ""
     local memfile = io.open("/proc/meminfo", "r")
     if memfile then
-        local memtxt = memfile:read("*all")
-        memfile:close()
+        local memtxt = memfile:read("*all"); memfile:close()
         local avail = memtxt:match("MemAvailable:%s+(%d+)%s+kB")
         if not avail then avail = memtxt:match("MemFree:%s+(%d+)%s+kB") end
         if avail then metrics = metrics .. "# sys_mem_avail_kb=" .. avail .. "\n" end
     end
     
-    -- 2. Strictly identify telemt PID
     local pid = ""
     for p in (sys.exec("pidof telemt 2>/dev/null") or ""):gmatch("%d+") do
-        local comm = (sys.exec("cat /proc/" .. p .. "/comm 2>/dev/null") or ""):gsub("%s+", "")
-        if comm == "telemt" then pid = p; break end
+        if (sys.exec("cat /proc/" .. p .. "/comm 2>/dev/null") or ""):gsub("%s+", "") == "telemt" then pid = p; break end
     end
 
     if pid ~= "" then
         metrics = metrics .. "# telemt_pid=" .. pid .. "\n"
-        -- 3. Read Process RSS Memory (No sys.exec overhead)
         local statfile = io.open("/proc/" .. pid .. "/status", "r")
         if statfile then
-            local stattxt = statfile:read("*all")
-            statfile:close()
+            local stattxt = statfile:read("*all"); statfile:close()
             local rss = stattxt:match("VmRSS:%s+(%d+)%s+kB")
             if rss then metrics = metrics .. "# telemt_rss_kb=" .. rss .. "\n" end
         end
-        -- 4. Only fetch from API if daemon is running
-        local fetch_cmd = (fetch_bin == "wget") and "wget -q --timeout=3 -O -" or "uclient-fetch -q --timeout=3 -O -"
-        metrics = metrics .. (sys.exec(string.format("%s 'http://127.0.0.1:%d/metrics' 2>/dev/null", fetch_cmd, m_port) .. " | grep -E '^telemt_user|^telemt_uptime|^telemt_connections|^telemt_desync'") or "")
+        
+        local prom_str = http_get_local("http://127.0.0.1:" .. m_port .. "/metrics", 2)
+        -- STARTING STATE FIX: Ensure UI knows daemon is alive but booting
+        if prom_str == "" then metrics = metrics .. "# telemt_state=starting\n" else metrics = metrics .. prom_str end
+        
+        if ext_rt == "1" then
+            metrics = metrics .. "\n---TELEMT_API_JSON---\n"
+            local api_json = http_get_local("http://127.0.0.1:" .. api_port .. "/v1/stats/minimal/all", 2)
+            metrics = metrics .. ((api_json ~= "" and api_json) or "{}")
+        end
     end
     
-    -- 5. Always append offline stats
-    local f = io.open("/tmp/telemt_stats.txt", "r")
-    if f then metrics = metrics .. "\n# ACCUMULATED\n"; for line in f:lines() do local u, tx, rx = line:match("^(%S+) (%S+) (%S+)$"); if u then metrics = metrics .. string.format("telemt_accumulated_tx{user=\"%s\"} %s\ntelemt_accumulated_rx{user=\"%s\"} %s\n", u, tx, u, rx) end end; f:close() end
-    http.prepare_content("text/plain")
-    pcall(function() http.write(metrics) end)
-    end_ajax(); return
+    -- READ RACE CONDITION FIX: Atomic copy before parsing accumulated stats
+    sys.call("cp -f /tmp/telemt_stats.txt /tmp/telemt_stats_read.tmp 2>/dev/null")
+    local f = io.open("/tmp/telemt_stats_read.tmp", "r")
+    if f then
+        metrics = metrics .. "\n# ACCUMULATED\n"
+        for line in f:lines() do
+            local u, tx, rx = line:match("^(%S+) (%S+) (%S+)$")
+            if u then metrics = metrics .. string.format("telemt_accumulated_tx{user=\"%s\"} %s\ntelemt_accumulated_rx{user=\"%s\"} %s\n", u, tx, u, rx) end
+        end
+        f:close()
+    end
+    
+    http.prepare_content("text/plain"); pcall(function() http.write(metrics) end); end_ajax(); return
 end
 
+-- ==============================================================================
+-- OTHER AJAX ENDPOINTS
+-- ==============================================================================
 if http.formvalue("get_scanners") == "1" then
     local m_port = tonumber(uci_cursor:get("telemt", "general", "metrics_port")) or 9092
-    local fetch_cmd = (fetch_bin == "wget") and "wget -q --timeout=3 -O -" or "uclient-fetch -q --timeout=3 -O -"
-    local res = sys.exec(string.format("%s 'http://127.0.0.1:%d/beobachten' 2>/dev/null", fetch_cmd, m_port))
+    local res = http_get_local("http://127.0.0.1:" .. m_port .. "/beobachten", 3)
     if not res or res:gsub("%s+", "") == "" then res = "No active scanners detected or proxy is offline." end
-    http.prepare_content("text/plain")
-    pcall(function() http.write(res) end)
-    end_ajax(); return
+    http.prepare_content("text/plain"); pcall(function() http.write(res) end); end_ajax(); return
 end
 
 if http.formvalue("get_log") == "1" then
     http.prepare_content("text/plain")
-    local cmd = "logread -e 'telemt' | tail -n 100 2>/dev/null"
-    if has_cmd("timeout") then cmd = "timeout 2 " .. cmd end
-    local log_data = sys.exec(cmd)
+    -- ANSI STRIP FIX: %a correctly removes ALL CSI codes including cursor movements (\e[K)
+    -- GREP EXPANSION: Catch OOM killer and Firewall activities
+    local log_data = sys.exec("logread 2>/dev/null | grep -iE 'telemt|mtproxy|sing-box|Allow-Telemt|nf_conntrack|Out\\.of\\.memory' | tail -n 100")
     if not log_data or log_data:gsub("%s+", "") == "" then log_data = "No logs found." end
-    log_data = log_data:gsub("\27%[[%d;]*m", "")
-    pcall(function() http.write(log_data) end)
-    end_ajax(); return
+    pcall(function() http.write(log_data:gsub("\27%[[%d;]*%a", "")) end); end_ajax(); return
 end
 
 if http.formvalue("get_wan_ip") == "1" then
-    local fetch_cmd = (fetch_bin == "wget") and "wget -q --timeout=3 -O -" or "uclient-fetch -q --timeout=3 -O -"
-    local ip = (sys.exec(fetch_cmd .. " https://ipv4.internet.yandex.net/api/v0/ip 2>/dev/null") or ""):gsub("%s+", ""):gsub("\"", "")
-    if not ip:match("^%d+%.%d+%.%d+%.%d+$") then ip = (sys.exec(fetch_cmd .. " https://checkip.amazonaws.com 2>/dev/null") or ""):gsub("%s+", "") end
-    http.prepare_content("text/plain")
-    pcall(function() http.write(ip:match("^%d+%.%d+%.%d+%.%d+$") and ip or "0.0.0.0") end)
-    end_ajax(); return
+    local ip = http_get_local("https://ipv4.internet.yandex.net/api/v0/ip", 3):gsub("%s+", ""):gsub("\"", "")
+    if not ip:match("^%d+%.%d+%.%d+%.%d+$") then ip = http_get_local("https://checkip.amazonaws.com", 3):gsub("%s+", "") end
+    http.prepare_content("text/plain"); pcall(function() http.write(ip:match("^%d+%.%d+%.%d+%.%d+$") and ip or "0.0.0.0") end); end_ajax(); return
 end
 
 if http.formvalue("get_qr") == "1" then
     local link = http.formvalue("link")
-    if not link or link == "" or not link:match("^tg://proxy%?[a-zA-Z0-9=%%&_.-]+$") then 
-        http.prepare_content("text/plain"); pcall(function() http.write("error: invalid_link") end); end_ajax(); return 
-    end
-    if not has_cmd("qrencode") then 
-        http.prepare_content("text/plain"); pcall(function() http.write("error: qrencode_missing") end); end_ajax(); return 
-    end
+    if not link or link == "" or not link:match("^tg://proxy%?[a-zA-Z0-9=%%&_.-]+$") then http.prepare_content("text/plain"); pcall(function() http.write("error: invalid_link") end); end_ajax(); return end
+    if not has_cmd("qrencode") then http.prepare_content("text/plain"); pcall(function() http.write("error: qrencode_missing") end); end_ajax(); return end
     local cmd = string.format("qrencode -t SVG -s 4 -m 1 -o - %q 2>/dev/null", link)
-    if has_cmd("timeout") then cmd = "timeout 2 " .. cmd end
-    http.prepare_content("image/svg+xml")
-    pcall(function() http.write(sys.exec(cmd)) end)
-    end_ajax(); return
+    http.prepare_content("image/svg+xml"); pcall(function() http.write(sys.exec(cmd)) end); end_ajax(); return
 end
 
 local function norm_secret(s) if not s then return nil end; s = s:match("secret=(%x+)") or s; local hex = s:match("(%x+)"); if not hex then return nil end; local pfx = hex:sub(1,2):lower(); if pfx == "ee" or pfx == "dd" then hex = hex:sub(3) end; if #hex < 32 then return nil end; return hex:sub(1, 32):lower() end
@@ -245,7 +251,7 @@ if is_post and http.formvalue("import_users") == "1" then
             end
             uci_cursor:save("telemt"); uci_cursor:commit("telemt")
             sys.call("logger -t telemt \"WebUI: Successfully imported " .. #valid_users .. " users via CSV.\"")
-            http.redirect(current_url .. (current_url:match("?") and "&" or "?") .. "import_ok=" .. tostring(#valid_users)); return
+            http.redirect(current_url .. qs_char .. "import_ok=" .. tostring(#valid_users)); return
         end
     end
     http.redirect(current_url); return
@@ -253,59 +259,29 @@ end
 
 local clean_csv = "username,secret,max_tcp_conns,max_unique_ips,data_quota,expire_date\n"
 uci_cursor:foreach("telemt", "user", function(s) clean_csv = clean_csv .. string.format("%s,%s,%s,%s,%s,%s\n", s['.name'] or "", s.secret or "", s.max_tcp_conns or "", s.max_unique_ips or "", s.data_quota or "", s.expire_date or "") end)
-clean_csv = clean_csv:gsub("\n", "\\n"):gsub("\r", "")
+clean_csv = clean_csv:gsub("\n", "\\n"):gsub("\r", ""):gsub('"', '\\"') -- ESCAPE FIX
 
 -- ==============================================================================
--- STATIC DASHBOARD RENDER (Version & Compatibility)
--- Safe semver compare, no behavior breakage
+-- STATIC DASHBOARD RENDER
 -- ==============================================================================
-local function parse_semver(v)
-    if not v or v == "" then return nil end
-    local a, b, c = tostring(v):match("^(%d+)%.(%d+)%.(%d+)$")
-    if not a then return nil end
-    return tonumber(a), tonumber(b), tonumber(c)
-end
+local bin_path = ""
+if sys.call("test -x /usr/bin/telemt") == 0 then bin_path = "/usr/bin/telemt"
+elseif sys.call("test -x /bin/telemt") == 0 then bin_path = "/bin/telemt" end
 
-local function semver_ge(v1, v2)
-    local a1, b1, c1 = parse_semver(v1)
-    local a2, b2, c2 = parse_semver(v2)
-    if not a1 or not a2 then return false end
-    if a1 ~= a2 then return a1 > a2 end
-    if b1 ~= b2 then return b1 > b2 end
-    return c1 >= c2
-end
-
-local bin_path = (sys.exec("command -v telemt 2>/dev/null") or ""):gsub("%s+", "")
 local bin_ver = "unknown"
 local comp_badge = "<span style='color:#d9534f;font-weight:bold;'>[ Not Installed ]</span>"
 
-if bin_path ~= "" then
-    local f = io.open("/var/etc/telemt.version", "r")
-    if f then
-        bin_ver = (f:read("*all") or ""):gsub("%s+", "")
-        f:close()
-    end
-
-    if bin_ver == "" then
-        bin_ver = (sys.exec("tail -c 128 /usr/bin/telemt 2>/dev/null | grep -a -i 'MTProxy v' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -n 1") or ""):gsub("%s+", "")
-    end
-
-    if bin_ver == "" then
-        bin_ver = "unknown"
-    end
-
-    if bin_ver == "unknown" then
-        comp_badge = "<span style='color:#d35400;font-weight:bold;'>[ Unknown Version ]</span>"
-    elseif semver_ge(bin_ver, "3.3.15") then
-        comp_badge = "<span style='color:#00a000;font-weight:bold;'>[ Compatible ]</span>"
-    else
-        comp_badge = "<span style='color:#d9534f;font-weight:bold;'>[ Unsupported Version ]</span>"
-    end
+if bin_path ~= "" then 
+    local f = io.open("/tmp/etc/telemt.version", "r")
+    if f then bin_ver = f:read("*all"):gsub("%s+", ""); f:close() end
+    if bin_ver == "" then bin_ver = (sys.exec("grep -a -m 1 -ioE 'MTProxy v[0-9]+\\.[0-9]+\\.[0-9]+' " .. bin_path .. " 2>/dev/null | head -n 1 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'") or ""):gsub("%s+", "") end
+    if bin_ver == "" then bin_ver = "unknown" end
+    
+    if bin_ver == "unknown" then comp_badge = "<span style='color:#d35400;font-weight:bold;'>[ Unknown Version ]</span>"
+    elseif cmp_ver(bin_ver, "3.3.15") >= 0 then comp_badge = "<span style='color:#00a000;font-weight:bold;'>[ Compatible ]</span>"
+    else comp_badge = "<span style='color:#d9534f;font-weight:bold;'>[ Unsupported Version ]</span>" end
 end
 
--- ==============================================================================
--- CBI MAP INITIALIZATION
--- ==============================================================================
 m = Map("telemt", "Telegram Proxy (MTProto)", [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.3.16</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.3.15+</span>]])
 m.on_commit = function(self) sys.call("logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'; /etc/init.d/telemt run_save_stats 2>/dev/null") end
 
@@ -331,8 +307,7 @@ ctrl.default = string.format([[
 </div>
 <script>
 function postAction(action) {
-    var f = new FormData();
-    f.append('telemt_action', action);
+    var f = new FormData(); f.append('telemt_action', action);
     var tok = null; var tn = document.querySelector('input[name="token"]');
     if (tn) tok = tn.value; else if (typeof L !== 'undefined' && L.env) tok = L.env.token || L.env.requesttoken || null;
     if (!tok) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tok = cm[1]; }
@@ -356,11 +331,10 @@ setTimeout(function(){
 }, 500);
 </script>]], current_url)
 
--- STATIC DASHBOARD RENDER (Version & Compatibility)
 local st_html = string.format([[
 <div style="font-family:monospace; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.2); border-radius:6px; padding:12px; line-height:1.6;">
     <div style="margin-bottom:4px;"><b>Service:</b> <span id="dash_status" style="color:#888;font-weight:bold;">PENDING...</span></div>
-    <div style="margin-bottom:8px;"><b>RAM :</b> Telemt RSS: <b id="dash_rss" style="color:#00a000;">--</b> &nbsp;|&nbsp; Mem Available: <b id="dash_ram" style="color:#555;">--</b></div>
+    <div style="margin-bottom:8px;"><b>Memory :</b> Telemt RSS: <b id="dash_rss" style="color:#00a000;">--</b> &nbsp;|&nbsp; Router Free: <b id="dash_ram" style="color:#555;">--</b></div>
     <div style="padding-top:8px; border-top:1px dashed rgba(128,128,128,0.2);">
         <b>Binary :</b> <span style="color:#555;">%s (v%s)</span> &nbsp;%s
     </div>
@@ -452,17 +426,9 @@ local mp = s:taboption("advanced", Flag, "use_middle_proxy", "Use ME Proxy" .. t
 local stun = s:taboption("advanced", Flag, "use_stun", "Enable STUN-probing" .. tip("Leave enabled if your server is behind NAT. Required for ME proxy on standard setups.")); stun:depends("use_middle_proxy", "1"); stun.default = "0"
 local meps = s:taboption("advanced", Value, "me_pool_size", "ME Pool Size" .. tip("Desired number of concurrent ME writers in pool. Default: 16.")); meps.datatype = "uinteger"; meps:depends("use_middle_proxy", "1")
 
--- DEEP ME TUNING (SPOILER)
 local h_me_adv = s:taboption("advanced", DummyValue, "_head_me_adv")
 h_me_adv.rawhtml = true
-h_me_adv.default = [[
-<div style="display:block; width:100%;">
-    <details id="telemt_me_opts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:15px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;">
-        <summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer; color:inherit;">Deep ME Tuning (Click to expand)</summary>
-        <p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Advanced Adaptive Pool and Recovery parameters. Edit only if you understand the runtime model.</p>
-    </details>
-</div>
-]]
+h_me_adv.default = [[<div style="display:block; width:100%;"><details id="telemt_me_opts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:15px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;"><summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer; color:inherit;">Deep ME Tuning (Click to expand)</summary><p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Advanced Adaptive Pool and Recovery parameters. Edit only if you understand the runtime model.</p></details></div>]]
 h_me_adv:depends("use_middle_proxy", "1")
 
 local fmode = s:taboption("advanced", ListValue, "me_floor_mode", "ME Floor Mode" .. tip("Static maintains fixed pool, Adaptive shrinks pool during idle.")); fmode:value("static", "Static (Fixed)"); fmode:value("adaptive", "Adaptive (Dynamic)"); fmode.default = "static"; fmode:depends("use_middle_proxy", "1")
@@ -476,19 +442,11 @@ s:taboption("advanced", Flag, "me_single_endpoint_outage_disable_quarantine", "B
 local mse_sr = s:taboption("advanced", Value, "me_single_endpoint_shadow_rotate_every_secs", "Shadow Rotate (sec)" .. tip("Period to refresh idle shadow writers. Default: 900.")); mse_sr.datatype = "uinteger"; mse_sr:depends("use_middle_proxy", "1")
 s:taboption("advanced", Flag, "hardswap", "ME Pool Hardswap" .. tip("Enable C-like hard-swap for ME pool generations.")):depends("use_middle_proxy", "1")
 local mdt = s:taboption("advanced", Value, "me_drain_ttl", "ME Drain TTL (sec)" .. tip("Drain-TTL in seconds for stale ME writers. Default: 90.")); mdt.datatype = "uinteger"; mdt:depends("use_middle_proxy", "1")
-local adeg = s:taboption("advanced", Flag, "auto_degradation", "Auto-Degradation" .. tip("Enable auto-degradation from ME to Direct-DC if ME fails. Default: enabled.")); adeg.default = "1"; adeg:depends("use_middle_proxy", "1")
+local adeg = s:taboption("advanced", Flag, "auto_degradation", "Auto-Degradation (Fallback)" .. tip("Enable auto-degradation from ME to Direct-DC if ME fails. Default: enabled.")); adeg.default = "1"; adeg:depends("use_middle_proxy", "1")
 local dmdc = s:taboption("advanced", Value, "degradation_min_dc", "Degradation Min DC" .. tip("Minimum unavailable ME DC groups before degrading. Default: 2.")); dmdc.datatype = "uinteger"; dmdc:depends({use_middle_proxy="1", auto_degradation="1"})
 
--- ADDITIONAL OPTIONS (SPOILER)
 local hadv = s:taboption("advanced", DummyValue, "_head_adv"); hadv.rawhtml = true
-hadv.default = [[
-<div style="display:block; width:100%;">
-    <details id="telemt_adv_opts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:20px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;">
-        <summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer;">Additional Options (Click to expand)</summary>
-        <p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Extra proxy settings and overrides.</p>
-    </details>
-</div>
-]]
+hadv.default = [[<div style="display:block; width:100%;"><details id="telemt_adv_opts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:20px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;"><summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer;">Additional Options (Click to expand)</summary><p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Extra proxy settings and overrides.</p></details></div>]]
 s:taboption("advanced", Flag, "desync_all_full", "Full Crypto-Desync Logs" .. tip("Emit full forensic logs for every event. Default: disabled (false).")).default = "0"
 local mpp = s:taboption("advanced", ListValue, "mask_proxy_protocol", "Mask Proxy Protocol" .. tip("Send PROXY protocol header to mask_host (if behind HAProxy/Nginx).")); mpp:value("0", "0 (Off)"); mpp:value("1", "1 (v1 - Text)"); mpp:value("2", "2 (v2 - Binary)"); mpp.default = "0"
 local aip = s:taboption("advanced", Value, "announce_ip", "Announce Address" .. tip("Optional. Public IP or Domain for tg:// links. Overrides 'External IP' if set.")); aip.datatype = "string"; aip.validate = validate_ip_domain
@@ -497,16 +455,8 @@ local fcl = s:taboption("advanced", Value, "fake_cert_len", "Fake Cert Length" .
 local ttlc = s:taboption("advanced", Value, "tls_full_cert_ttl_secs", "TLS Full Cert TTL (sec)" .. tip("Time-to-Live for the full certificate chain per client IP. Default: 90.")); ttlc.datatype = "uinteger"
 s:taboption("advanced", Flag, "ignore_time_skew", "Ignore Time Skew" .. tip("Disable strict time checks. Useful if clients have desynced clocks.")).default = "0"
 
--- TIMEOUTS (SPOILER)
 local htm = s:taboption("advanced", DummyValue, "_head_tm"); htm.rawhtml = true
-htm.default = [[
-<div style="display:block; width:100%;">
-    <details id="telemt_timeouts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:20px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;">
-        <summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer;">Timeouts & Replay Protection (Click to expand)</summary>
-        <p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Adjust connection timeouts and replay window. Leave defaults if unsure.</p>
-    </details>
-</div>
-]]
+htm.default = [[<div style="display:block; width:100%;"><details id="telemt_timeouts_details" style="display:block; width:100%; box-sizing:border-box; margin-top:20px; padding:10px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.3); border-radius:6px; cursor:pointer;"><summary style="font-weight:bold; font-size:1.05em; outline:none; cursor:pointer;">Timeouts & Replay Protection (Click to expand)</summary><p style="font-size:0.85em; opacity:0.8; margin-top:5px; margin-bottom:0;">Adjust connection timeouts and replay window. Leave defaults if unsure.</p></details></div>]]
 local tm_h = s:taboption("advanced", Value, "tm_handshake", "Handshake" .. tip("Client handshake timeout in seconds.")); tm_h.datatype = "uinteger"; tm_h.default = "15"
 local tm_c = s:taboption("advanced", Value, "tm_connect", "Connect" .. tip("Telegram DC connect timeout in seconds.")); tm_c.datatype = "uinteger"; tm_c.default = "10"
 local tm_k = s:taboption("advanced", Value, "tm_keepalive", "Keepalive" .. tip("Client keepalive interval in seconds.")); tm_k.datatype = "uinteger"; tm_k.default = "60"
@@ -545,21 +495,45 @@ local bc = s:taboption("bot", Value, "bot_chat_id", "Admin Chat ID" .. tip("Your
 function bc.validate(self, v) if v and v ~= "" and not v:match("^%-?[0-9]+$") then return nil, "Invalid Chat ID! Must be a numeric ID." end return v end
 
 -- === TAB: DIAGNOSTICS ===
-local lv = s:taboption("log", DummyValue, "_lv"); lv.rawhtml = true
-lv.default = [[
-<div class="telemt-dash-top-row" style="margin-bottom:15px; padding:12px; background:rgba(128,128,128,0.05); border:1px solid var(--border-color, rgba(128,128,128,0.2)); border-radius:6px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-    <div style="font-weight:bold; font-size:1.05em; color:var(--text-color, #555);">Diagnostics & Maintenance</div>
-    <div style="display:flex; gap:10px; flex-wrap:wrap;">
-        <input type="button" class="cbi-button cbi-button-action" id="btn_export_config" value="Export Active Config" style="background:#4a90e2; color:#fff; border:1px solid #357abd;" />
-        <input type="button" class="cbi-button cbi-button-remove" id="btn_reset_config" value="Reset to defaults" />
+local diag = s:taboption("log", DummyValue, "_diag")
+diag.rawhtml = true
+diag.default = [[
+<div class="telemt-panel" style="display:block; width:100% !important; max-width:none !important; clear:both; box-sizing:border-box;">
+    <div id="telemt_health_summary" style="margin-bottom:20px;">
+        <h3 style="margin-top:0; border-bottom:2px solid var(--border-color, #ccc); padding-bottom:5px;">Health Summary</h3>
+        
+        <div style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:15px;" id="diag_gates">
+            <span style="color:#888;">Fetching Runtime Status...</span>
+        </div>
+        
+        <div style="display:flex; flex-wrap:wrap; gap:15px; width:100%;">
+            <div style="flex:1 1 300px; background:rgba(128,128,128,0.03); border:1px solid rgba(128,128,128,0.2); border-radius:6px; padding:15px; box-sizing:border-box;">
+                <h4 style="margin-top:0; color:#0069d6; border-bottom:1px dashed #ccc; padding-bottom:5px;">Upstreams Status</h4>
+                <div id="diag_upstreams" style="max-height:250px; overflow-y:auto; overflow-x:hidden;">Loading...</div>
+            </div>
+            <div style="flex:1 1 300px; background:rgba(128,128,128,0.03); border:1px solid rgba(128,128,128,0.2); border-radius:6px; padding:15px; box-sizing:border-box;">
+                <h4 style="margin-top:0; color:#0069d6; border-bottom:1px dashed #ccc; padding-bottom:5px;">Datacenters (ME)</h4>
+                <div id="diag_dcs" style="max-height:250px; overflow-y:auto; overflow-x:hidden;">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="telemt-dash-top-row" style="margin-top:20px; margin-bottom:15px; padding:15px; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.2); border-radius:6px; display:flex; justify-content:flex-start; align-items:center; flex-wrap:wrap; gap:15px;">
+        <div style="font-weight:bold; font-size:1.1em; color:#555; margin-right:15px;">Maintenance</div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <input type="button" class="cbi-button cbi-button-action" id="btn_export_config" value="Export Active Config" style="background:#4a90e2; color:#fff; border:1px solid #357abd;" />
+            <input type="button" class="cbi-button cbi-button-remove" id="btn_reset_config" value="Reset to defaults" />
+        </div>
+    </div>
+
+    <div style="width:100%; box-sizing:border-box; height:350px; font-family:monospace; font-size:12px; padding:12px; background:#1e1e1e; color:#d4d4d4; border:1px solid #333; border-radius:4px; overflow-y:auto; overflow-x:auto; white-space:pre;" id="telemt_log_container">Click a button below to load data.</div>
+    <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+        <input type="button" class="cbi-button cbi-button-apply" id="btn_load_log" value="System Log" />
+        <input type="button" class="cbi-button cbi-button-reset" id="btn_load_scanners" value="Show Active Scanners" />
+        <input type="button" class="cbi-button cbi-button-action" id="btn_copy_log" value="Copy Output" />
     </div>
 </div>
-<div style="width:100%; box-sizing:border-box; height:500px; font-family:monospace; font-size:12px; padding:12px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #333; border-radius: 4px; overflow-y:auto; overflow-x:auto; white-space:pre;" id="telemt_log_container">Click a button below to load data.</div>
-<div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
-    <input type="button" class="cbi-button cbi-button-apply" id="btn_load_log" value="System Log" />
-    <input type="button" class="cbi-button cbi-button-reset" id="btn_load_scanners" value="Show Active Scanners" />
-    <input type="button" class="cbi-button cbi-button-action" id="btn_copy_log" value="Copy Output" />
-</div>
+
 <script>
 setTimeout(function(){
     document.getElementById('btn_load_log').addEventListener('click', loadLog);
@@ -618,60 +592,23 @@ local lnk = s2:option(DummyValue, "_link", "Ready-to-use link" .. tip("Click the
 
 m.description = [[
 <style>
-/* Hiding standard LuCI help icons and tooltips */
 .cbi-value-helpicon, img[src*="help.gif"], img[src*="help.png"], .cbi-tooltip-container, .cbi-tooltip { display: none !important; }
-
-/* FIX FOR OPENWRT 24.10+ DEFAULT BLUE QUESTION MARKS */
 .cbi-value-description::before, .cbi-value-description img { display: none !important; content: none !important; margin: 0 !important; padding: 0 !important; width: 0 !important; height: 0 !important; }
-
 #cbi-telemt-user .cbi-section-table-descr { display: none !important; width: 0 !important; height: 0 !important; visibility: hidden !important; }
 #cbi-telemt-user .cbi-row-template, #cbi-telemt-user [id*="-template"] { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; pointer-events: none !important; }
-
-/* Add User / Upstream Buttons */
 html body #cbi-telemt-user .cbi-button-add, html body #cbi-telemt-upstream .cbi-button-add { color: #00a000 !important; background-color: transparent !important; border: 1px solid #00a000 !important; transition: all 0.2s ease !important; padding: 0 16px !important; height: 32px !important; line-height: 30px !important; border-radius: 4px !important; font-weight: bold !important; }
 html body #cbi-telemt-user .cbi-button-add:hover, html body #cbi-telemt-upstream .cbi-button-add:hover { background-color: #00a000 !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; }
-
 #cbi-telemt-user .cbi-section-table td:first-child { vertical-align: middle !important; }
-
-/* Upstreams Block Fix (Cards and Buttons - STRICT BOTTOM LEFT) */
-#cbi-telemt-upstream .cbi-section-node-row,
-#cbi-telemt-upstream > div:not([id$="-template"]) {
-    display: flex !important;
-    flex-direction: column !important;
-    background: rgba(128,128,128,0.03) !important;
-    border: 1px solid var(--border-color, rgba(128,128,128,0.2)) !important;
-    border-radius: 8px !important;
-    padding: 15px !important;
-    margin-bottom: 20px !important;
-    transition: all 0.3s ease;
-}
-#cbi-telemt-upstream > div:not([id$="-template"]) > .cbi-section-remove,
-#cbi-telemt-upstream .cbi-section-node > .cbi-section-remove {
-    order: 99 !important;
-    align-self: flex-start !important;
-    margin-top: 15px !important;
-    padding-top: 15px !important;
-    border-top: 1px dashed var(--border-color, rgba(128,128,128,0.3)) !important;
-    width: 100% !important;
-    text-align: left !important;
-}
+#cbi-telemt-upstream .cbi-section-node-row, #cbi-telemt-upstream > div:not([id$="-template"]) { display: flex !important; flex-direction: column !important; background: rgba(128,128,128,0.03) !important; border: 1px solid var(--border-color, rgba(128,128,128,0.2)) !important; border-radius: 8px !important; padding: 15px !important; margin-bottom: 20px !important; transition: all 0.3s ease; }
+#cbi-telemt-upstream > div:not([id$="-template"]) > .cbi-section-remove, #cbi-telemt-upstream .cbi-section-node > .cbi-section-remove { order: 99 !important; align-self: flex-start !important; margin-top: 15px !important; padding-top: 15px !important; border-top: 1px dashed var(--border-color, rgba(128,128,128,0.3)) !important; width: 100% !important; text-align: left !important; }
 html body #cbi-telemt-upstream .cbi-button-remove { display: inline-block !important; float: left !important; margin: 0 !important; color: #d9534f !important; background-color: transparent !important; border: 1px solid #d9534f !important; padding: 0 12px !important; height: 30px !important; line-height: 28px !important; font-weight: normal !important; transition: all 0.2s ease !important; }
 html body #cbi-telemt-upstream .cbi-button-remove:hover { background-color: #d9534f !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; }
-
-/* ADVANCED TUNING SPOILERS WIDTH FIX */
-div[id^="cbi-telemt-advanced-_head_adv"] .cbi-value-title,
-div[id^="cbi-telemt-advanced-_head_tm"] .cbi-value-title,
-div[id^="cbi-telemt-advanced-_head_me_adv"] .cbi-value-title { display: none !important; }
-
-div[id^="cbi-telemt-advanced-_head_adv"] .cbi-value-field,
-div[id^="cbi-telemt-advanced-_head_tm"] .cbi-value-field,
-div[id^="cbi-telemt-advanced-_head_me_adv"] .cbi-value-field { width: 100% !important; padding: 0 !important; margin: 0 !important; float: none !important; }
-
+div[id^="cbi-telemt-advanced-_head_adv"] .cbi-value-title, div[id^="cbi-telemt-advanced-_head_tm"] .cbi-value-title, div[id^="cbi-telemt-advanced-_head_me_adv"] .cbi-value-title { display: none !important; }
+div[id^="cbi-telemt-advanced-_head_adv"] .cbi-value-field, div[id^="cbi-telemt-advanced-_head_tm"] .cbi-value-field, div[id^="cbi-telemt-advanced-_head_me_adv"] .cbi-value-field { width: 100% !important; padding: 0 !important; margin: 0 !important; float: none !important; }
 .cbi-value-description { margin: -8px 0 0 0 !important; padding: 0 !important; font-size: 0.85em !important; opacity: 0.8; white-space: normal !important; }
 .telemt-tip { display: inline-block !important; vertical-align: middle !important; white-space: nowrap !important; cursor: help !important; opacity: 0.5 !important; font-size: 0.85em !important; border-bottom: 1px dotted currentColor !important; margin-left: 4px !important; margin-top: -2px !important; }
 #cbi-telemt-user .cbi-section-table th { white-space: nowrap !important; vertical-align: middle !important; }
 #cbi-telemt-user .cbi-section-table { table-layout: auto !important; }
-
 [data-name="external_ip"] .cbi-value-field, #cbi-telemt-general-external_ip .cbi-value-field { display: flex !important; align-items: center !important; }
 #telemt_mirror_ip, input[name*="cbid.telemt.general.external_ip"] { flex: 0 1 250px !important; width: 250px !important; max-width: 250px !important; box-sizing: border-box !important; }
 .telemt-sec-wrap { display: flex; flex-direction: column; width: 100%; position: relative; gap: 4px; }
@@ -680,19 +617,13 @@ div[id^="cbi-telemt-advanced-_head_me_adv"] .cbi-value-field { width: 100% !impo
 .telemt-sec-btns input:last-child { margin-right: 0; }
 .telemt-num-wrap { display: flex !important; align-items: center !important; width: 100% !important; box-sizing: border-box !important; gap: 4px; height: 32px; }
 .telemt-num-wrap > input:not([type="button"]) { flex: 1 1 auto !important; width: 100% !important; min-width: 40px !important; box-sizing: border-box !important; margin: 0 !important; height: 100% !important; }
-
 .telemt-btn-cross { flex: 0 0 24px !important; width: 24px !important; min-width: 24px !important; height: 24px !important; min-height: 24px !important; padding: 0 !important; margin: 0 !important; cursor: pointer !important; background-color: transparent !important; background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23666666' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='18' y1='6' x2='6' y2='18'/%3E%3Cline x1='6' y1='6' x2='18' y2='18'/%3E%3C/svg%3E") !important; background-repeat: no-repeat !important; background-position: center !important; background-size: 14px !important; border: none !important; box-shadow: none !important; opacity: 1 !important; transition: all 0.2s ease !important; }
 .telemt-btn-cross:hover { background-color: rgba(217, 83, 79, 0.1) !important; border-radius: 4px; background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23d9534f' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='18' y1='6' x2='6' y2='18'/%3E%3Cline x1='6' y1='6' x2='18' y2='18'/%3E%3C/svg%3E") !important; }
 .telemt-cal-wrap { position: relative; display: flex; flex: 0 0 24px; width: 24px; height: 24px; margin: 0; }
 .telemt-btn-cal { width: 100% !important; height: 100% !important; padding: 0 !important; margin: 0 !important; cursor: pointer !important; background-color: transparent !important; background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23666666' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2' ry='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E") !important; background-repeat: no-repeat !important; background-position: center !important; background-size: 14px !important; border: none !important; }
 .telemt-cal-wrap:hover .telemt-btn-cal { background-color: rgba(0, 160, 0, 0.1) !important; border-radius: 4px; background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300a000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2' ry='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E") !important; }
 .telemt-cal-picker { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; color-scheme: light dark; z-index:2; }
-
-@media (prefers-color-scheme: dark) {
-    .telemt-btn-cross { background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23cccccc' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='18' y1='6' x2='6' y2='18'/%3E%3Cline x1='6' y1='6' x2='18' y2='18'/%3E%3C/svg%3E") !important; }
-    .telemt-btn-cal { background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23cccccc' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2' ry='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E") !important; }
-}
-
+@media (prefers-color-scheme: dark) { .telemt-btn-cross { background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23cccccc' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='18' y1='6' x2='6' y2='18'/%3E%3Cline x1='6' y1='6' x2='18' y2='18'/%3E%3C/svg%3E") !important; } .telemt-btn-cal { background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23cccccc' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2' ry='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E") !important; } }
 #cbi-telemt-user .user-link-out { height: 32px !important; line-height: 32px !important; width: 100%; font-family: monospace; font-size: 11px; background: transparent !important; color: inherit !important; border: 1px solid var(--border-color, rgba(128,128,128,0.5)) !important; box-sizing: border-box; margin: 0; cursor: pointer; }
 .user-link-err { color: #d9534f !important; font-weight: bold; border-color: #d9534f !important; }
 .user-flat-stat { display: flex; flex-wrap: wrap; align-items: center; line-height: 1.4; font-size: 0.95em; }
@@ -700,57 +631,23 @@ div[id^="cbi-telemt-advanced-_head_me_adv"] .cbi-value-field { width: 100% !impo
 .user-flat-stat > *:last-child { margin-right: 0; }
 .stat-divider, .sum-divider { color: #ccc; margin: 0 4px; }
 .btn-controls input { width: auto; margin-right: 5px; }
-
-.telemt-dash-summary { font-size:1.05em; display:flex; flex-wrap:wrap; align-items:center; flex: 1 1 auto; row-gap: 5px; }
-.telemt-dash-summary > span { margin-right: 12px; white-space: nowrap; }
 .link-btn-group { display: flex; margin-top: 4px; }
 .telemt-conns-bold { font-weight: bold; }
 
-@media screen and (min-width: 769px) {
-    #cbi-telemt-user .cbi-section-table { width: 100% !important; table-layout: auto !important; }
-    #cbi-telemt-user .cbi-section-table td { padding: 6px 8px !important; white-space: nowrap !important; vertical-align: middle !important; }
-    .user-flat-stat, .user-flat-stat > div { flex-wrap: nowrap !important; white-space: nowrap !important; }
-    td[data-name="_stat"] { min-width: 180px !important; }
-    td[data-name="max_tcp_conns"] .telemt-num-wrap, td[data-name="max_unique_ips"] .telemt-num-wrap, td[data-name="data_quota"] .telemt-num-wrap { max-width: 95px !important; }
-    td[data-name="expire_date"] { min-width: 155px !important; }
-    td[data-name="expire_date"] .telemt-num-wrap { min-width: 155px !important; width: 100% !important; }
-    td[data-name="_link"] .link-wrapper { min-width: 160px !important; }
-    td[data-name="secret"] .telemt-sec-wrap { min-width: 160px !important; }
-    .telemt-dash-btns { display: flex !important; align-items: center !important; gap: 10px !important; flex: 0 0 auto !important; margin-left: auto; }
-    .telemt-action-btns { display: flex !important; align-items: center !important; justify-content: center !important; gap: 10px !important; flex: 0 0 auto !important; }
-    .telemt-dash-btns input.cbi-button, .telemt-action-btns input.cbi-button { float: none !important; margin: 0 !important; display: inline-block !important; position: static !important; }
-    .telemt-dash-top-row { display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(0,160,0,0.05); border:1px solid rgba(0,160,0,0.2); border-radius:6px; margin-bottom:15px; flex-wrap:wrap; gap:15px; }
-    .telemt-dash-bot-row { display:flex; flex-direction:column; justify-content:center; align-items:center; gap:10px; margin-bottom:15px; text-align:center; width:100%; }
-    .telemt-dash-warn { font-size:1em; color:#d35400; font-weight:bold; text-align:center; }
-}
-
-@media screen and (max-width: 768px) {
-    #telemt_mirror_ip, input[name*="cbid.telemt.general.external_ip"] { flex: 1 1 100% !important; width: 100% !important; max-width: 100% !important; }
-    #cbi-telemt-user .cbi-section-table .cbi-section-table-row { display: flex !important; flex-direction: column !important; margin-bottom: 15px !important; border: 1px solid var(--border-color, #ddd) !important; padding: 10px !important; border-radius: 6px !important; }
-    #cbi-telemt-user .cbi-section-table td { display: block !important; width: 100% !important; box-sizing: border-box !important; padding: 6px 0 !important; border: none !important; white-space: normal !important; }
-    #cbi-telemt-user .cbi-section-table td[data-title]::before { content: attr(data-title) !important; display: block !important; font-weight: bold !important; margin-bottom: 4px !important; color: var(--text-color, #555) !important; }
-    #cbi-telemt-user .cbi-section-actions .cbi-button::before, #cbi-telemt-user td .cbi-button::before { display: none !important; content: none !important; }
-    #cbi-telemt-user .cbi-section-actions, #cbi-telemt-user td.cbi-section-actions, #cbi-telemt-user .cbi-section-table td:last-child { display: block !important; visibility: visible !important; opacity: 1 !important; padding: 10px 0 0 0 !important; overflow: visible !important; width: 100% !important; }
-    html body #cbi-telemt-user .cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross), html body #cbi-telemt-user td.cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross) { display: flex !important; width: 100% !important; height: 44px !important; line-height: 44px !important; align-items: center !important; justify-content: center !important; }
-    .user-flat-stat, .user-flat-stat > div { flex-direction: column; align-items: flex-start; flex-wrap: wrap !important; }
-    .telemt-dash-summary { flex-direction: column; align-items: flex-start; }
-    .telemt-dash-summary > span { margin-right: 0 !important; margin-bottom: 6px !important; display: block !important; width: 100% !important; white-space: normal !important; }
-    .stat-divider, .sum-divider { display: none !important; }
-    .telemt-dash-btns, .telemt-action-btns { flex-direction: column; width: 100%; gap: 8px !important; margin-top:10px; }
-    .telemt-dash-btns input.cbi-button, .telemt-action-btns input.cbi-button { width: 100% !important; height: 36px !important; }
-    .link-btn-group { flex-direction: row !important; width: 100%; display: flex; margin-top: 5px; }
-    .telemt-sec-btns input.cbi-button, .link-btn-group input.cbi-button { height: 32px !important; min-height: 32px !important; line-height: 30px !important; font-size: 13px !important; margin-right: 5px; }
-    .telemt-dash-top-row { display:flex; flex-direction:column; padding:12px; background:rgba(0,160,0,0.05); border:1px solid rgba(0,160,0,0.2); border-radius:6px; margin-bottom:15px; }
-    .telemt-dash-bot-row { display:flex; flex-direction:column; margin-bottom:15px; gap:15px; text-align:center; }
-}
-
-/* DARK CSV MODAL */
+@media screen and (min-width: 769px) { #cbi-telemt-user .cbi-section-table { width: 100% !important; table-layout: auto !important; } #cbi-telemt-user .cbi-section-table td { padding: 6px 8px !important; white-space: nowrap !important; vertical-align: middle !important; } .user-flat-stat, .user-flat-stat > div { flex-wrap: nowrap !important; white-space: nowrap !important; } td[data-name="_stat"] { min-width: 180px !important; } td[data-name="max_tcp_conns"] .telemt-num-wrap, td[data-name="max_unique_ips"] .telemt-num-wrap, td[data-name="data_quota"] .telemt-num-wrap { max-width: 95px !important; } td[data-name="expire_date"] { min-width: 155px !important; } td[data-name="expire_date"] .telemt-num-wrap { min-width: 155px !important; width: 100% !important; } td[data-name="_link"] .link-wrapper { min-width: 160px !important; } td[data-name="secret"] .telemt-sec-wrap { min-width: 160px !important; } .telemt-dash-btns { display: flex !important; align-items: center !important; gap: 10px !important; flex: 0 0 auto !important; margin-left: auto; } .telemt-action-btns { display: flex !important; align-items: center !important; justify-content: center !important; gap: 10px !important; flex: 0 0 auto !important; } .telemt-dash-btns input.cbi-button, .telemt-action-btns input.cbi-button { float: none !important; margin: 0 !important; display: inline-block !important; position: static !important; } .telemt-dash-top-row { display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(0,160,0,0.05); border:1px solid rgba(0,160,0,0.2); border-radius:6px; margin-bottom:15px; flex-wrap:wrap; gap:15px; } .telemt-dash-bot-row { display:flex; flex-direction:column; justify-content:center; align-items:center; gap:10px; margin-bottom:15px; text-align:center; width:100%; } .telemt-dash-warn { font-size:1em; color:#d35400; font-weight:bold; text-align:center; } }
+@media screen and (max-width: 768px) { #telemt_mirror_ip, input[name*="cbid.telemt.general.external_ip"] { flex: 1 1 100% !important; width: 100% !important; max-width: 100% !important; } #cbi-telemt-user .cbi-section-table .cbi-section-table-row { display: flex !important; flex-direction: column !important; margin-bottom: 15px !important; border: 1px solid var(--border-color, #ddd) !important; padding: 10px !important; border-radius: 6px !important; } #cbi-telemt-user .cbi-section-table td { display: block !important; width: 100% !important; box-sizing: border-box !important; padding: 6px 0 !important; border: none !important; white-space: normal !important; } #cbi-telemt-user .cbi-section-table td[data-title]::before { content: attr(data-title) !important; display: block !important; font-weight: bold !important; margin-bottom: 4px !important; color: var(--text-color, #555) !important; } #cbi-telemt-user .cbi-section-actions .cbi-button::before, #cbi-telemt-user td .cbi-button::before { display: none !important; content: none !important; } #cbi-telemt-user .cbi-section-actions, #cbi-telemt-user td.cbi-section-actions, #cbi-telemt-user .cbi-section-table td:last-child { display: block !important; visibility: visible !important; opacity: 1 !important; padding: 10px 0 0 0 !important; overflow: visible !important; width: 100% !important; } html body #cbi-telemt-user .cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross), html body #cbi-telemt-user td.cbi-section-actions .cbi-button-remove:not(.telemt-btn-cross) { display: flex !important; width: 100% !important; height: 44px !important; line-height: 44px !important; align-items: center !important; justify-content: center !important; } .user-flat-stat, .user-flat-stat > div { flex-direction: column; align-items: flex-start; flex-wrap: wrap !important; } .stat-divider, .sum-divider { display: none !important; } .telemt-dash-btns, .telemt-action-btns { flex-direction: column; width: 100%; gap: 8px !important; margin-top:10px; } .telemt-dash-btns input.cbi-button, .telemt-action-btns input.cbi-button { width: 100% !important; height: 36px !important; } .link-btn-group { flex-direction: row !important; width: 100%; display: flex; margin-top: 5px; } .telemt-sec-btns input.cbi-button, .link-btn-group input.cbi-button { height: 32px !important; min-height: 32px !important; line-height: 30px !important; font-size: 13px !important; margin-right: 5px; } .telemt-dash-top-row { display:flex; flex-direction:column; padding:12px; background:rgba(0,160,0,0.05); border:1px solid rgba(0,160,0,0.2); border-radius:6px; margin-bottom:15px; } .telemt-dash-bot-row { display:flex; flex-direction:column; margin-bottom:15px; gap:15px; text-align:center; } }
 .qr-modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 2147483647 !important; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
 .qr-modal-overlay.active { opacity: 1; pointer-events: auto; }
 .custom-modal-content { background-color: #1e1e1e !important; color: #dddddd !important; padding: 20px; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.8); border: 1px solid #444 !important; text-align: center; max-width: 450px; width: 90%; }
 .custom-modal-content p, .custom-modal-content h3, .custom-modal-content label, .custom-modal-content span { color: #dddddd !important; }
 .custom-modal-content svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
 #csv_text_area { background-color: #121212 !important; color: #00ff00 !important; width: 100%; height: 120px; font-family: monospace; font-size: 11px; margin-bottom: 10px; box-sizing: border-box; padding: 5px; resize: vertical; border: 1px solid #555 !important; }
+.badge { display:inline-block; padding:4px 8px; border-radius:4px; font-weight:bold; font-size:0.85em; text-transform:uppercase; margin-right:5px; margin-bottom:5px; }
+.badge-ok { background:rgba(0,160,0,0.1); color:#00a000; border:1px solid rgba(0,160,0,0.3); }
+.badge-err { background:rgba(217,83,79,0.1); color:#d9534f; border:1px solid rgba(217,83,79,0.3); }
+.badge-gray { background:rgba(128,128,128,0.1); color:#888; border:1px solid rgba(128,128,128,0.3); }
+#cbi-telemt-log-_diag .cbi-value-title { display: none !important; }
+#cbi-telemt-log-_diag .cbi-value-field { width: 100% !important; padding: 0 !important; margin: 0 !important; float: none !important; }
 </style>
 
 <script type="text/javascript">
@@ -762,25 +659,17 @@ function escHTML(s) { return String(s).replace(/[&<>'"]/g, function(c) { return 
 function formatMB(bytes) { if(!bytes || bytes === 0) return '0.00 MB'; var mb = bytes / 1048576; if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB'; return mb.toFixed(2) + ' MB'; }
 function formatUptime(secs) { if(!secs) return '0s'; var d = Math.floor(secs/86400), h = Math.floor((secs%86400)/3600), m = Math.floor((secs%3600)/60), s = Math.floor(secs%60); var str = ""; if(d>0) str += d+"d "; if(h>0 || d>0) str += h+"h "; str += m+"m "+s+"s"; return str; }
 
-window._telemtLastStats = null;
-
-function cleanResponse(txt) {
-    if (!txt) return '';
-    var cut = txt.search(/<(!DOCTYPE|html[\s>])/i);
-    if (cut > 0) return txt.substring(0, cut).trim();
-    return txt;
-}
+// ONLY use cleanResponse for Prometheus parsing. Log content bypasses this to preserve HTTP artifacts.
+function cleanResponse(txt) { if (!txt) return ''; var cut = txt.search(/<(!DOCTYPE|html[\s>])/i); if (cut > 0) return txt.substring(0, cut).trim(); return txt; }
 
 // -----------------------------------------------------------------------------
-// DEBOUNCED SPOILER REPACKER (Prevents MutationObserver infinite loops)
+// DEBOUNCED SPOILER REPACKER
 // -----------------------------------------------------------------------------
 var isRepacking = false;
 var repackTimer = null;
 
 function repackAllSpoilers() {
     isRepacking = true;
-    var moved = 0;
-    
     var spoilerMaps = {
         'telemt_me_opts_details': ['me_floor_mode', 'me_adaptive_floor_idle_secs', 'me_adaptive_floor_recover_grace_secs', 'me_adaptive_floor_min_writers_single_endpoint', 'me_warm_standby', 'me_single_endpoint_shadow_writers', 'me_single_endpoint_outage_mode_enabled', 'me_single_endpoint_outage_disable_quarantine', 'me_single_endpoint_shadow_rotate_every_secs', 'hardswap', 'me_drain_ttl', 'auto_degradation', 'degradation_min_dc'],
         'telemt_adv_opts_details': ['desync_all_full', 'mask_proxy_protocol', 'announce_ip', 'ad_tag', 'fake_cert_len', 'tls_full_cert_ttl_secs', 'ignore_time_skew'],
@@ -790,18 +679,11 @@ function repackAllSpoilers() {
     for (var detailsId in spoilerMaps) {
         var detailsNode = document.getElementById(detailsId);
         if (!detailsNode) continue;
-        
         spoilerMaps[detailsId].forEach(function(fieldName) {
             var el = document.querySelector('.cbi-value[data-name="' + fieldName + '"]') || document.getElementById('cbi-telemt-general-' + fieldName) || document.querySelector('[id$="-' + fieldName + '"]');
-            if (el && el.parentNode !== detailsNode) {
-                el.style.paddingLeft = '15px';
-                detailsNode.appendChild(el);
-                moved++;
-            }
+            if (el && el.parentNode !== detailsNode) { el.style.paddingLeft = '15px'; detailsNode.appendChild(el); }
         });
     }
-    
-    // Release lock after DOM has settled
     setTimeout(function() { isRepacking = false; }, 50);
 }
 
@@ -811,108 +693,220 @@ function scheduleRepack() {
     repackTimer = setTimeout(repackAllSpoilers, 80);
 }
 
-// Bind to select elements to ensure repack fires smoothly on interaction
 document.addEventListener('change', function(e) {
     if (e.target && (e.target.name && (e.target.name.indexOf('use_middle_proxy') > -1 || e.target.name.indexOf('me_floor_mode') > -1 || e.target.name.indexOf('auto_degradation') > -1))) {
         scheduleRepack();
     }
 });
 
-// -----------------------------------------------------------------------------
-
 function updateCascadesState() {
     var upRows = document.querySelectorAll('#cbi-telemt-upstream .cbi-section-node:not([id*="-template"])');
     var masterSwitch = document.querySelector('input[type="checkbox"][name*="enable_upstreams"]');
     if (masterSwitch) {
-        if (upRows.length === 0) {
-            masterSwitch.disabled = true; masterSwitch.checked = false; masterSwitch.title = "No cascades configured";
-        } else {
-            masterSwitch.disabled = false; masterSwitch.title = "";
-        }
-        
+        if (upRows.length === 0) { masterSwitch.disabled = true; masterSwitch.checked = false; masterSwitch.title = "No cascades configured"; } 
+        else { masterSwitch.disabled = false; masterSwitch.title = ""; }
         upRows.forEach(function(row) {
-            if (!masterSwitch.checked) {
-                row.style.opacity = '0.4';
-                row.style.filter = 'grayscale(1)';
-                row.style.pointerEvents = 'none';
-            } else {
-                row.style.opacity = '1';
-                row.style.filter = '';
-                row.style.pointerEvents = 'auto';
-            }
+            if (!masterSwitch.checked) { row.style.opacity = '0.4'; row.style.filter = 'grayscale(1)'; row.style.pointerEvents = 'none'; } 
+            else { row.style.opacity = '1'; row.style.filter = ''; row.style.pointerEvents = 'auto'; }
         });
-        
-        if (!masterSwitch.dataset.injected) {
-            masterSwitch.dataset.injected = "1";
-            masterSwitch.addEventListener('change', updateCascadesState);
-        }
+        if (!masterSwitch.dataset.injected) { masterSwitch.dataset.injected = "1"; masterSwitch.addEventListener('change', updateCascadesState); }
     }
 }
 
 function setOfflineState() {
-    var sEl = document.getElementById('dash_status');
-    if(sEl) { sEl.innerText = 'STOPPED'; sEl.style.color = '#d9534f'; }
-    var rEl = document.getElementById('dash_rss');
-    if(rEl) { rEl.innerText = '0 MB'; rEl.style.color = '#888'; }
+    var sEl = document.getElementById('dash_status'); if(sEl) { sEl.innerText = 'STOPPED'; sEl.style.color = '#d9534f'; }
+    var rEl = document.getElementById('dash_rss'); if(rEl) { rEl.innerText = '0 MB'; rEl.style.color = '#888'; }
+    document.querySelectorAll('.user-flat-stat').forEach(function(el) { el.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ Offline ]</span>"; });
     
-    document.querySelectorAll('.user-flat-stat').forEach(function(el) {
-        el.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ Offline ]</span>";
-    });
     var sumEl = document.getElementById('telemt_users_summary_inner');
-    if (sumEl) { 
-        sumEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>Status: Daemon Stopped</span>"; 
+    if (sumEl) sumEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>Status: Daemon Stopped</span>";
+    
+    var dg = document.getElementById('diag_gates');
+    if(dg) dg.innerHTML = '<span class="badge badge-err">Daemon Stopped</span>';
+    var dUp = document.getElementById('diag_upstreams'), dDc = document.getElementById('diag_dcs');
+    if(dUp) dUp.innerHTML = '<span style="color:#888">Offline</span>';
+    if(dDc) dDc.innerHTML = '<span style="color:#888">Offline</span>';
+    
+    window._telemtLastTime = 0;
+    window._telemtLastTotalRx = 0;
+    window._telemtLastTotalTx = 0;
+}
+
+// FIX: Unified Universal API Parser for both Users Summary and Health Grid
+function parseApiResponse(apiData) {
+    var result = { ok: false, runtime: null, stats: null, reason: '' };
+    if (!apiData || typeof apiData !== 'object') return result;
+    
+    if (apiData.runtime || apiData.stats) {
+        result.ok = true;
+        result.runtime = apiData.runtime || {};
+        result.stats = apiData.stats || {};
+    } else if (apiData.ok && apiData.data) {
+        result.ok = true;
+        result.reason = apiData.data.reason || '';
+        result.stats = apiData.data.data || {};
+        var meW = result.stats.me_writers || {};
+        result.runtime = {
+            route_mode: meW.middle_proxy_enabled ? 'middle' : 'direct',
+            me_runtime_ready: !!meW.middle_proxy_enabled,
+            me2dc_fallback_enabled: !!(result.stats.fallback_active || meW.fallback_enabled),
+            reroute_active: !!(result.stats.reroute_active),
+            accepting_new_connections: !!apiData.data.enabled
+        };
+    }
+    return result;
+}
+
+function renderHealthGrid(apiData, promText) {
+    var dg = document.getElementById('diag_gates');
+    var dUp = document.getElementById('diag_upstreams');
+    var dDc = document.getElementById('diag_dcs');
+    
+    var probesMatch = promText.match(/telemt_desync_total\s+([0-9\.]+)/);
+    var probes = probesMatch ? parseInt(probesMatch[1], 10) : 0;
+    
+    var badMatch1 = promText.match(/telemt_connections_bad_total\s+([0-9\.]+)/);
+    var badMatch2 = promText.match(/telemt_me_handshake_reject_total\s+([0-9\.]+)/);
+    var scans = (badMatch1 ? parseInt(badMatch1[1], 10) : 0) + (badMatch2 ? parseInt(badMatch2[1], 10) : 0);
+    
+    var upActiveMatch = promText.match(/telemt_upstream_connects_active\s+([0-9\.]+)/);
+    var upFailsMatch = promText.match(/telemt_upstream_fails_total\s+([0-9\.]+)/);
+    var promUpActive = upActiveMatch ? upActiveMatch[1] : '0';
+    var promUpFails = upFailsMatch ? upFailsMatch[1] : '0';
+
+    var promBadges = '<span class="badge badge-err">DPI Probes: ' + probes + '</span><span class="badge badge-err">Rejected/Scans: ' + scans + '</span>';
+
+    var parsed = parseApiResponse(apiData);
+    var rt = parsed.runtime;
+    var st = parsed.stats;
+    var apiOk = parsed.ok;
+
+    if (!apiOk || !rt) {
+        var hasAnyProm = promText.indexOf('telemt_') > -1;
+        var apiMsg = hasAnyProm 
+            ? '<span class="badge badge-err">Control API: Offline</span><span style="font-size:0.85em; color:#888; display:block; margin-top:5px;">API port не отвечает. Проверьте api_port и extended_runtime_enabled.</span>'
+            : '<span class="badge badge-err">Daemon: No Metrics</span>';
+        
+        if(dg) dg.innerHTML = apiMsg + promBadges;
+        if(dUp) dUp.innerHTML = '<div style="color:#888; padding:10px;"><b>Detailed tables require Control API.</b><br><br><b>Active Connects:</b> ' + promUpActive + ' | <b>Fails:</b> ' + promUpFails + '</div>';
+        if(dDc) dDc.innerHTML = '<div style="color:#888; padding:10px;">ME detailed stats require Control API.</div>';
+        return;
+    }
+    
+    var mode = rt.route_mode || "direct";
+    var meRdy = rt.me_runtime_ready ? '<span class="badge badge-ok">ME: Ready</span>' : '<span class="badge badge-gray">ME: Disabled</span>';
+    var fb = rt.me2dc_fallback_enabled ? '<span class="badge badge-err">Fallback: ON</span>' : '<span class="badge badge-ok">Fallback: OFF</span>';
+    var rroute = rt.reroute_active ? '<span class="badge badge-err">Reroute: ON</span>' : '<span class="badge badge-ok">Reroute: OFF</span>';
+    var acc = rt.accepting_new_connections ? '<span class="badge badge-ok">Accepting</span>' : '<span class="badge badge-err">Rejecting</span>';
+    
+    if(dg) dg.innerHTML = '<span class="badge ' + (mode==='middle'?'badge-ok':'badge-gray') + '">Mode: ' + escHTML(mode) + '</span>' + meRdy + fb + rroute + acc + promBadges;
+    
+    if (dUp) {
+        if (st && st.upstreams && Array.isArray(st.upstreams) && st.upstreams.length > 0) {
+            var ups = st.upstreams;
+            var uHtml = '<div style="display:flex; justify-content:space-between; font-weight:bold; color:#888; border-bottom:1px solid rgba(128,128,128,0.3); padding-bottom:4px; margin-bottom:4px;"><div style="flex:1">Address</div><div style="flex:0 0 60px; text-align:right;">Status</div><div style="flex:0 0 50px; text-align:right;">Fails</div><div style="flex:0 0 60px; text-align:right;">Lat</div></div>';
+            for (var i=0; i<ups.length; i++) {
+                var up = ups[i] || {};
+                var stCol = up.healthy ? '<span style="color:#00a000">OK</span>' : '<span style="color:#d9534f">FAIL</span>';
+                uHtml += '<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed rgba(128,128,128,0.15);"><div style="flex:1; word-break:break-all; padding-right:5px;">' + escHTML(up.address || '-') + '</div><div style="flex:0 0 60px; text-align:right;">' + stCol + '</div><div style="flex:0 0 50px; text-align:right;">' + (up.fails || 0) + '</div><div style="flex:0 0 60px; text-align:right;">' + (up.effective_latency_ms || 0) + 'ms</div></div>';
+            }
+            dUp.innerHTML = uHtml;
+        } else if (parsed.reason === 'source_unavailable') {
+            dUp.innerHTML = '<div style="color:#888; padding:10px;">Direct routing active or detailed upstream info unavailable.<br><br><b>Active Connects:</b> ' + promUpActive + ' | <b>Fails:</b> ' + promUpFails + '</div>';
+        } else {
+            dUp.innerHTML = '<div style="color:#888; text-align:center; padding:10px;">Direct routing active</div>';
+        }
+    }
+    
+    if (dDc) {
+        var dcs = [];
+        if (st && Array.isArray(st.dcs)) {
+            dcs = st.dcs;
+        } else if (st && st.dcs && Array.isArray(st.dcs.dcs)) {
+            dcs = st.dcs.dcs;
+        } else if (st && st.dcs && typeof st.dcs === 'object' && Object.keys(st.dcs).length > 0) {
+            dcs = Object.values(st.dcs);
+        }
+        
+        if (dcs.length > 0) {
+            var dHtml = '<div style="display:flex; justify-content:space-between; font-weight:bold; color:#888; border-bottom:1px solid rgba(128,128,128,0.3); padding-bottom:4px; margin-bottom:4px;"><div style="flex:1">DC ID</div><div style="flex:0 0 100px; text-align:right;">Writers (A/R)</div><div style="flex:0 0 70px; text-align:right;">Coverage</div><div style="flex:0 0 60px; text-align:right;">RTT</div></div>';
+            for (var k=0; k<dcs.length; k++) {
+                var dc = dcs[k] || {};
+                var coverage = Number(dc.coverage_pct || 0);
+                var covCol = coverage >= 100 ? '<span style="color:#00a000">' + coverage + '%</span>' : '<span style="color:#d9534f">' + coverage + '%</span>';
+                dHtml += '<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed rgba(128,128,128,0.15);"><div style="flex:1">DC ' + escHTML(String(dc.dc || '-')) + '</div><div style="flex:0 0 100px; text-align:right;">' + (dc.alive_writers || 0) + ' / ' + (dc.required_writers || 0) + '</div><div style="flex:0 0 70px; text-align:right;">' + covCol + '</div><div style="flex:0 0 60px; text-align:right;">' + (dc.rtt_ema_ms || 0) + 'ms</div></div>';
+            }
+            dDc.innerHTML = dHtml;
+        } else if (rt && rt.me_runtime_ready) {
+            dDc.innerHTML = '<div style="text-align:center; color:#d35400; padding:10px;">ME enabled, waiting for DC connections...</div>';
+        } else if (parsed.reason === 'source_unavailable') {
+            dDc.innerHTML = '<div style="color:#888; padding:10px;">ME detailed stats unavailable (source down or ME disabled).</div>';
+        } else {
+            dDc.innerHTML = '<div style="text-align:center; color:#888; padding:10px;">ME disabled</div>';
+        }
     }
 }
 
 function fetchMetrics() {
-    if (!document.getElementById('cbi-telemt-general') && !document.getElementById('cbi-telemt-user') && !document.getElementById('cbi-telemt-upstream')) { stopTimers(); return; }
-    if (window._telemtFetching) return; window._telemtFetching = true;
+    if (!document.getElementById('cbi-telemt-general') && !document.getElementById('cbi-telemt-user') && !document.getElementById('diag_gates')) { stopTimers(); return Promise.resolve(); }
+    if (window._telemtFetching) return Promise.resolve();
+    window._telemtFetching = true;
     
     var controller = window.AbortController ? new AbortController() : null;
     var signal = controller ? controller.signal : null;
-    if (controller) { setTimeout(function() { controller.abort(); }, 4000); }
+    if (controller) { setTimeout(function() { controller.abort(); }, 8000); }
 
-    fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_metrics=1&_t=' + Date.now(), signal ? { signal: signal } : {}).then(r => {
+    return fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_metrics=1&_t=' + Date.now(), signal ? { signal: signal } : {})
+    .then(r => {
         if (!r.ok) throw new Error("HTTP " + r.status);
         return r.text();
     }).then(txt => {
         window._telemtFetching = false; 
-        txt = cleanResponse(txt || ""); 
+        txt = txt || ""; 
         
-        var pidMatch = txt.match(/# telemt_pid=(\d+)/);
-        var rssMatch = txt.match(/# telemt_rss_kb=(\d+)/);
-        var ramMatch = txt.match(/# sys_mem_avail_kb=(\d+)/);
+        var parts = txt.split('---TELEMT_API_JSON---');
+        var promText = cleanResponse(parts[0] || "");
+        var apiJsonStr = (parts[1] || "").trim();
+        
+        var apiData = null;
+        if (apiJsonStr !== "") {
+            try { apiData = JSON.parse(apiJsonStr); } catch(e) { apiData = null; }
+        }
+        
+        var pidMatch = promText.match(/# telemt_pid=(\d+)/);
+        var rssMatch = promText.match(/# telemt_rss_kb=(\d+)/);
+        var ramMatch = promText.match(/# sys_mem_avail_kb=(\d+)/);
         
         if (ramMatch) {
             var ramEl = document.getElementById('dash_ram');
-            if (ramEl) ramEl.innerText = (parseInt(ramMatch[1]) / 1024).toFixed(1) + ' MB';
+            if (ramEl) ramEl.innerText = (parseInt(ramMatch[1], 10) / 1024).toFixed(1) + ' MB';
         }
 
         if (rssMatch) {
             var rssEl = document.getElementById('dash_rss');
-            if (rssEl) {
-                rssEl.innerText = (parseInt(rssMatch[1]) / 1024).toFixed(1) + ' MB';
-                rssEl.style.color = '#00a000';
-            }
+            if (rssEl) { rssEl.innerText = (parseInt(rssMatch[1], 10) / 1024).toFixed(1) + ' MB'; rssEl.style.color = '#00a000'; }
         }
         
-        if (!pidMatch) {
+        var isOffline = !pidMatch;
+        var startingMatch = promText.match(/# telemt_state=starting/);
+        
+        var stEl = document.getElementById('dash_status');
+        if (isOffline) {
             setOfflineState();
-            // Continue parsing only for offline accumulated stats
+        } else if (startingMatch) {
+            if (stEl) { stEl.innerText = "STARTING (PID: " + pidMatch[1] + ")"; stEl.style.color = "#d35400"; }
         } else {
-            var stEl = document.getElementById('dash_status');
             if (stEl) { stEl.innerText = "RUNNING (PID: " + pidMatch[1] + ")"; stEl.style.color = "#00a000"; }
         }
         
         var userStats = {}; var allUserRows = document.querySelectorAll('.user-flat-stat');
         allUserRows.forEach(function(statEl) { var u = statEl.getAttribute('data-user'); if(u) userStats[u] = { live_rx: 0, live_tx: 0, acc_rx: 0, acc_tx: 0, conns: 0 }; });
         
-        var globalStatsObj = { uptime: 0, dpi: 0 }; var totalLiveRx = 0, totalLiveTx = 0, totalAccRx = 0, totalAccTx = 0;
-        var lines = txt.split('\n');
+        var globalStatsObj = { uptime: 0 }; var totalLiveRx = 0, totalLiveTx = 0, totalAccRx = 0, totalAccTx = 0;
+        var lines = promText.split('\n');
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i].trim(); if (line.indexOf('#') === 0 || line === "") continue;
-            if (line.indexOf('telemt_uptime_seconds') === 0) { var m = line.match(/\s+([0-9\.eE\+\-]+)/); if(m) globalStatsObj.uptime = parseFloat(m[1]); continue; }
-            if (line.indexOf('telemt_desync_total') === 0) { var m = line.match(/\s+([0-9\.eE\+\-]+)/); if(m) globalStatsObj.dpi += parseFloat(m[1]); continue; }
+            if (/^telemt_uptime_seconds(\s|$)/.test(line)) { var m = line.match(/\s+([0-9\.eE\+\-]+)/); if(m) globalStatsObj.uptime = parseFloat(m[1]); continue; }
             var userMatch = line.match(/user="([^"]+)"/);
             if (userMatch) {
                 var u = userMatch[1]; if (!userStats[u]) userStats[u] = { live_rx: 0, live_tx: 0, acc_rx: 0, acc_tx: 0, conns: 0 };
@@ -927,7 +921,8 @@ function fetchMetrics() {
                 }
             }
         }
-        window._telemtLastStats = userStats; var totalRx = totalLiveRx + totalAccRx; var totalTx = totalLiveTx + totalAccTx;
+        
+        var totalRx = totalLiveRx + totalAccRx; var totalTx = totalLiveTx + totalAccTx;
         var totalConfiguredUsers = allUserRows.length; var usersOnline = 0;
         
         allUserRows.forEach(function(statEl) {
@@ -939,44 +934,17 @@ function fetchMetrics() {
             
             var isExpired = false;
             if (eStr) { var p = eStr.split(' '); if(p.length==2) { var d=p[0].split('.'); var t=p[1].split(':'); if(d.length==3 && t.length==2) { if (Date.now() > new Date(d[2], d[1]-1, d[0], t[0], t[1]).getTime()) isExpired = true; } } }
-            
             var isOverQuota = false;
             if (qStr) { var qGB = parseFloat(qStr); if (!isNaN(qGB) && qGB > 0) { if ((finalTx + finalRx) >= (qGB * 1073741824)) isOverQuota = true; } }
             
-            if (isExpired) { 
-                if (isEn !== "0" || (cb && cb.checked)) {
-                    if (cb) cb.checked = false;
-                    var f = new FormData(); f.append('auto_pause_user', u); f.append('reason', 'Expired');
-                    var tokenVal = null; var tokenNode = document.querySelector('input[name="token"]');
-                    if (tokenNode) tokenVal = tokenNode.value; else if (typeof L !== 'undefined' && L.env) tokenVal = L.env.token || L.env.requesttoken || null;
-                    if (!tokenVal) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tokenVal = cm[1]; }
-                    if (tokenVal) f.append('token', tokenVal); fetch(lu_current_url.split('#')[0], { method: 'POST', body: f });
-                    statEl.setAttribute('data-en', '0');
-                }
-                statEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ PAUSED: EXPIRED ]</span>"; return; 
-            }
-            if (isOverQuota) { 
-                if (isEn !== "0" || (cb && cb.checked)) {
-                    if (cb) cb.checked = false;
-                    var f = new FormData(); f.append('auto_pause_user', u); f.append('reason', 'Quota Exceeded');
-                    var tokenVal = null; var tokenNode = document.querySelector('input[name="token"]');
-                    if (tokenNode) tokenVal = tokenNode.value; else if (typeof L !== 'undefined' && L.env) tokenVal = L.env.token || L.env.requesttoken || null;
-                    if (!tokenVal) { var cm = document.cookie.match(/(?:sysauth_http|sysauth)=([^;]+)/); if (cm) tokenVal = cm[1]; }
-                    if (tokenVal) f.append('token', tokenVal); fetch(lu_current_url.split('#')[0], { method: 'POST', body: f });
-                    statEl.setAttribute('data-en', '0');
-                }
-                statEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ PAUSED: QUOTA ]</span>"; return; 
-            }
-            if (isEn === "0" || (cb && !cb.checked)) { statEl.innerHTML = "<span style='color:#888; font-weight:bold;'>[ PAUSED: MANUAL ]</span>"; return; }
-            
-            if (!pidMatch) {
-                statEl.innerHTML = "<span style='color:#888;'>Offline (Saved DL: " + formatMB(finalTx) + ", UL: " + formatMB(finalRx) + ")</span>";
-                return;
-            }
+            if (isExpired) { statEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ EXPIRED ]</span>"; return; }
+            if (isOverQuota) { statEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ QUOTA ]</span>"; return; }
+            if (isEn === "0" || (cb && !cb.checked)) { statEl.innerHTML = "<span style='color:#888; font-weight:bold;'>[ PAUSED ]</span>"; return; }
+            if (isOffline) { statEl.innerHTML = "<span style='color:#888;'>Offline (DL: " + formatMB(finalTx) + ")</span>"; return; }
             
             var c_col = stat.conns > 0 ? "#00a000" : "#888"; 
             var dotUser = "<svg width='10' height='10' style='vertical-align:middle;'><circle cx='5' cy='5' r='5' fill='" + c_col + "'/></svg>";
-            statEl.innerHTML = "<div style='display:flex; align-items:center; gap:4px; margin-bottom:2px; flex-wrap:wrap;'><span style='white-space:nowrap; color:#00a000;'>&darr; " + formatMB(finalTx) + "</span> <span class='stat-divider'>/</span> <span style='white-space:nowrap; color:#d35400;'>&uarr; " + formatMB(finalRx) + "</span> <span class='stat-divider'>|</span> <span style='white-space:nowrap; color:" + c_col + "; display:inline-flex; align-items:center;'>" + dotUser + "&nbsp;" + stat.conns + "&nbsp;<small style='margin-left:3px; font-weight:normal;'>conns</small></span></div>";
+            statEl.innerHTML = "<div style='display:flex; align-items:center; gap:4px; margin-bottom:2px; flex-wrap:wrap;'><span style='color:#00a000;'>&darr; " + formatMB(finalTx) + "</span> <span class='stat-divider'>/</span> <span style='color:#d35400;'>&uarr; " + formatMB(finalRx) + "</span> <span class='stat-divider'>|</span> <span style='color:" + c_col + ";'>" + dotUser + "&nbsp;" + stat.conns + "&nbsp;<small>conns</small></span></div>";
         });
         
         var now = Date.now(); var speedDL = 0, speedUL = 0; 
@@ -984,17 +952,30 @@ function fetchMetrics() {
         else { var diffSec = (now - window._telemtLastTime) / 1000.0; if (diffSec > 0) { var dRx = totalRx - window._telemtLastTotalRx; var dTx = totalTx - window._telemtLastTotalTx; if (dRx >= 0) speedUL = (dRx * 8) / 1048576 / diffSec; if (dTx >= 0) speedDL = (dTx * 8) / 1048576 / diffSec; } window._telemtLastTime = now; window._telemtLastTotalRx = totalRx; window._telemtLastTotalTx = totalTx; }
         
         var sumEl = document.getElementById('telemt_users_summary_inner');
-        if (sumEl) {
-            var dpiHtml = "<span class='sum-divider'>|</span><span><span style='font-weight:bold; color:#555;'>DPI Probes:</span> <span style='color:" + (globalStatsObj.dpi > 0 ? "#d9534f" : "#00a000") + "; font-weight:bold; margin-left:4px;'>" + globalStatsObj.dpi + "</span></span>";
-            if (!pidMatch) {
-                sumEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>Status: Daemon Stopped</span><span class='sum-divider'>|</span><span><b style='color:#555;'>Saved DL:</b> <span style='color:#888;'>&darr; " + formatMB(totalTx) + "</span></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Saved UL:</b> <span style='color:#888;'>&uarr; " + formatMB(totalRx) + "</span></span>"; 
-            } else {
-                sumEl.innerHTML = "<b style='margin-right:6px;'>Uptime:</b><span style='color:#666;'>" + formatUptime(globalStatsObj.uptime) + "</span><span class='sum-divider'>|</span><span><b style='color:#555;'>Total DL:</b> <span style='color:#00a000;'>&darr; " + formatMB(totalTx) + "</span></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Total UL:</b> <span style='color:#d35400;'>&uarr; " + formatMB(totalRx) + "</span></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Bandwidth:</b> <span style='color:#00a000;'>&darr; " + speedDL.toFixed(2) + "</span> <span style='color:#d35400; margin-left:4px;'>&uarr; " + speedUL.toFixed(2) + "</span> <small>Mbps</small></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Users Online:</b> <b style='color:#00a000; margin-left:4px;'>" + usersOnline + "</b><span style='margin:0 4px;'>/</span>" + totalConfiguredUsers + "</span>" + dpiHtml; 
+        if (sumEl && !isOffline) {
+            var statStr = "<b style='margin-right:6px;'>Uptime:</b><span style='color:#666;'>" + formatUptime(globalStatsObj.uptime) + "</span><span class='sum-divider'>|</span><span><b style='color:#555;'>Total DL:</b> <span style='color:#00a000;'>&darr; " + formatMB(totalTx) + "</span></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Total UL:</b> <span style='color:#d35400;'>&uarr; " + formatMB(totalRx) + "</span></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Bandwidth:</b> <span style='color:#00a000;'>&darr; " + speedDL.toFixed(2) + "</span> <span style='color:#d35400; margin-left:4px;'>&uarr; " + speedUL.toFixed(2) + "</span> <small>Mbps</small></span><span class='sum-divider'>|</span><span><b style='color:#555;'>Users Online:</b> <b style='color:#00a000; margin-left:4px;'>" + usersOnline + "</b><span style='margin:0 4px;'>/</span>" + totalConfiguredUsers + "</span>";
+            
+            var parsed = parseApiResponse(apiData);
+            var rMode = "Unknown (API Req)", meReady = "<span style='color:#888'>N/A</span>";
+            
+            if (parsed.ok && parsed.runtime) {
+                rMode = parsed.runtime.route_mode || "direct";
+                meReady = parsed.runtime.me_runtime_ready ? "<span style='color:#00a000'>Ready</span>" : "<span style='color:#888'>Disabled</span>";
             }
+            sumEl.innerHTML = statStr + "<div style='margin-top:6px; padding-top:6px; border-top:1px dashed #ccc; font-size:0.9em;'><b>Live Routing:</b> " + escHTML(rMode) + " <span class='sum-divider'>|</span> <b>ME Status:</b> " + meReady + "</div>";
         }
-    }).catch(() => { 
+        
+        if (document.getElementById('diag_gates') && !isOffline) {
+            renderHealthGrid(apiData, promText);
+        }
+        
+    }).catch(err => { 
         window._telemtFetching = false; 
-        setOfflineState();
+        if (err && err.name === 'AbortError') { console.warn('[Telemt] Metrics fetch timeout, skipping update'); return; }
+        var sEl = document.getElementById('dash_status');
+        if (sEl) { sEl.innerText = 'CONNECTION LOST'; sEl.style.color = '#d35400'; }
+    }).finally(() => {
+        window._telemtFetching = false;
     });
 }
 
@@ -1013,22 +994,75 @@ function updateLinks() {
     updateCascadesState();
 }
 
-function copyProxyLink(btn) { var row = btn.closest('.cbi-section-table-row') || btn.closest('.cbi-row'); if (!row) return; var input = row.querySelector('.user-link-out'); if (input && !input.classList.contains('user-link-err')) { var textToCopy = input.value; fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', 'Proxy link copied'); return f;})() }); if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(textToCopy).then(function() { var oldVal = btn.value; btn.value = '?'; setTimeout(function(){ btn.value = oldVal; }, 1500); }); } else { input.select(); input.setSelectionRange(0, 99999); try { if(document.execCommand('copy')) { var oldVal = btn.value; btn.value = '?'; setTimeout(function(){ btn.value = oldVal; }, 1500); } } catch(e) {} } } }
+function fallbackCopy(text, btn) {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); btn.value = 'Copied!'; setTimeout(function(){ btn.value = 'Copy'; }, 1500); } 
+    catch(e) { btn.value = 'Copy failed'; }
+    document.body.removeChild(ta);
+}
+
+function copyProxyLink(btn) { 
+    var row = btn.closest('.cbi-section-table-row') || btn.closest('.cbi-row'); if (!row) return; 
+    var input = row.querySelector('.user-link-out'); 
+    if (input && !input.classList.contains('user-link-err')) { 
+        var textToCopy = input.value; 
+        fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', 'Proxy link copied'); return f;})() }); 
+        if (navigator.clipboard && window.isSecureContext) { 
+            navigator.clipboard.writeText(textToCopy).then(function() { var oldVal = btn.value; btn.value = '✔'; setTimeout(function(){ btn.value = oldVal; }, 1500); }).catch(function() { fallbackCopy(textToCopy, btn); }); 
+        } else { fallbackCopy(textToCopy, btn); } 
+    } 
+}
 
 function genRandHex() { var arr = new Uint8Array(16); (window.crypto || window.msCrypto).getRandomValues(arr); var h = ""; for(var i=0; i<16; i++) { var hex = arr[i].toString(16); if(hex.length < 2) hex = "0" + hex; h += hex; } return h; }
 
 function fetchIPViaWget(btn) { var oldVal = btn.value; btn.value = '...'; fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_wan_ip=1&_t=' + Date.now()).then(r => r.text()).then(txt => { txt = cleanResponse(txt); var match = txt.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/); if (match) { var master = document.querySelector('input[name*="cbid.telemt.general.external_ip"]'); var mirror = document.getElementById('telemt_mirror_ip'); if(master) master.value = match[0]; if(mirror) mirror.value = match[0]; updateLinks(); } btn.value = oldVal; }).catch(() => { btn.value = oldVal; }); }
 
-function loadLog() { var btn = document.getElementById('btn_load_log'); if(!btn) return; var oldVal = btn.value; btn.value = 'Loading...'; fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_log=1&_t=' + Date.now()).then(r => r.text()).then(txt => { document.getElementById('telemt_log_container').textContent = cleanResponse(txt) || 'No logs found.'; btn.value = 'System Log'; }).catch(() => { btn.value = 'Error'; }); }
-function loadScanners() { var btn = document.getElementById('btn_load_scanners'); if(!btn) return; var oldVal = btn.value; btn.value = 'Loading...'; fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_scanners=1&_t=' + Date.now()).then(r => r.text()).then(txt => { document.getElementById('telemt_log_container').textContent = "=== [ ACTIVE DPI SCANNERS (beobachten.txt) ] ===\n\n" + (cleanResponse(txt) || 'No data.'); btn.value = 'Refresh Scanners'; }).catch(() => { btn.value = 'Error'; }); }
-function copyLogContent(btn) { var logText = document.getElementById('telemt_log_container').textContent; if(!logText) return; var ta = document.createElement('textarea'); ta.value = logText; document.body.appendChild(ta); ta.select(); try { if(document.execCommand('copy')) { var oldVal = btn.value; btn.value = 'Copied!'; setTimeout(function(){ btn.value = oldVal; }, 1500); } } catch(e) {} document.body.removeChild(ta); }
+function loadLog() { 
+    var btn = document.getElementById('btn_load_log'); if(!btn) return; 
+    btn.value = 'Loading...'; btn.disabled = true;
+    fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_log=1&_t=' + Date.now())
+    .then(r => r.text()).then(txt => { 
+        txt = txt || '';
+        var htmlTail = txt.lastIndexOf('<!DOCTYPE');
+        if (htmlTail > 0 && htmlTail > txt.length * 0.8) { txt = txt.substring(0, htmlTail).trim(); }
+        document.getElementById('telemt_log_container').textContent = txt || 'No logs found.'; 
+        btn.value = 'System Log'; 
+    }).catch(() => { 
+        document.getElementById('telemt_log_container').textContent = 'Error: Could not fetch log. Check LuCI connection.';
+        btn.value = 'System Log (retry)'; 
+    }).finally(() => { btn.disabled = false; }); 
+}
+
+function loadScanners() { 
+    var btn = document.getElementById('btn_load_scanners'); if(!btn) return; 
+    btn.value = 'Loading...'; btn.disabled = true;
+    fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_scanners=1&_t=' + Date.now())
+    .then(r => r.text()).then(txt => { 
+        txt = (txt || '').replace(/<(!DOCTYPE|html[\s>]).*$/is, '').trim();
+        document.getElementById('telemt_log_container').textContent = "=== [ ACTIVE DPI SCANNERS (beobachten.txt) ] ===\n\n" + (txt || 'No data.'); 
+        btn.value = 'Refresh Scanners'; 
+    }).catch(() => { 
+        document.getElementById('telemt_log_container').textContent = 'Error fetching scanners data.';
+        btn.value = 'Error'; 
+    }).finally(() => { btn.disabled = false; }); 
+}
+
+function copyLogContent(btn) { 
+    var logText = document.getElementById('telemt_log_container').textContent; if(!logText) return; 
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(logText).then(function() {
+            var oldVal = btn.value; btn.value = 'Copied!'; setTimeout(function(){ btn.value = oldVal; }, 1500);
+        }).catch(function() { fallbackCopy(logText, btn); });
+    } else { fallbackCopy(logText, btn); }
+}
 
 function updateFWStatus() { if (!document.getElementById('cbi-telemt-general')) return; var fwSpan = document.getElementById('fw_status_span'); if (!fwSpan) return; fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_fw_status=1&_t=' + Date.now()).then(r => r.text()).then(txt => { txt = cleanResponse(txt); if(txt.indexOf('OPEN') > -1 || txt.indexOf('CLOSED') > -1 || txt.indexOf('STOPPED') > -1) fwSpan.innerHTML = txt; }).catch(()=>{}); }
 
 function closeModals() { document.querySelectorAll('.qr-modal-overlay').forEach(function(m) { m.classList.remove('active'); }); document.body.classList.remove('qr-modal-open'); }
-function showQRModal(link) { if (!link || link.indexOf('Error') === 0) return; var overlay = document.getElementById('qr-modal'); if (!overlay) { overlay = document.createElement('div'); overlay.id = 'qr-modal-overlay'; overlay.className = 'qr-modal-overlay'; var content = document.createElement('div'); content.className = 'custom-modal-content'; var body = document.createElement('div'); body.id = 'qr-modal-body'; content.appendChild(body); var clsBtn = document.createElement('button'); clsBtn.className = 'cbi-button cbi-button-reset'; clsBtn.style.cssText = 'margin-top:15px; width:100%;'; clsBtn.innerText = 'Close'; clsBtn.addEventListener('click', closeModals); content.appendChild(clsBtn); overlay.appendChild(content); document.body.appendChild(overlay); overlay.addEventListener('click', function(e) { if (e.target === overlay) closeModals(); }); } var body = document.getElementById('qr-modal-body'); body.innerHTML = 'Generating...'; overlay.classList.add('active'); document.body.classList.add('qr-modal-open'); fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_qr=1&link=' + encodeURIComponent(link) + '&_t=' + Date.now()).then(r => r.text()).then(txt => { txt = cleanResponse(txt); if (txt.indexOf('error: qrencode_missing') > -1) body.innerHTML = '<div style="color:#d9534f; font-weight:bold; margin-bottom:10px;">Install qrencode</div>'; else if (txt.indexOf('error: invalid_link') > -1) body.innerHTML = '<div style="color:#d9534f; font-weight:bold;">Invalid Link Format</div>'; else { var svgMatch = txt.match(/<svg[\s\S]*?<\/svg>/i); body.innerHTML = svgMatch ? svgMatch[0] : 'Error'; } }).catch(() => { body.innerHTML = 'Connection error.'; }); }
+function showQRModal(link) { if (!link || link.indexOf('Error') === 0) return; var overlay = document.getElementById('qr-modal-overlay'); if (!overlay) { overlay = document.createElement('div'); overlay.id = 'qr-modal-overlay'; overlay.className = 'qr-modal-overlay'; var content = document.createElement('div'); content.className = 'custom-modal-content'; var body = document.createElement('div'); body.id = 'qr-modal-body'; content.appendChild(body); var clsBtn = document.createElement('button'); clsBtn.className = 'cbi-button cbi-button-reset'; clsBtn.style.cssText = 'margin-top:15px; width:100%;'; clsBtn.innerText = 'Close'; clsBtn.addEventListener('click', closeModals); content.appendChild(clsBtn); overlay.appendChild(content); document.body.appendChild(overlay); overlay.addEventListener('click', function(e) { if (e.target === overlay) closeModals(); }); } var body = document.getElementById('qr-modal-body'); body.innerHTML = 'Generating...'; overlay.classList.add('active'); document.body.classList.add('qr-modal-open'); fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_qr=1&link=' + encodeURIComponent(link) + '&_t=' + Date.now()).then(r => r.text()).then(txt => { txt = cleanResponse(txt); if (txt.indexOf('error: qrencode_missing') > -1) body.innerHTML = '<div style="color:#d9534f; font-weight:bold; margin-bottom:10px;">Install qrencode</div>'; else if (txt.indexOf('error: invalid_link') > -1) body.innerHTML = '<div style="color:#d9534f; font-weight:bold;">Invalid Link Format</div>'; else { var svgMatch = txt.match(/<svg[\s\S]*?<\/svg>/i); body.innerHTML = svgMatch ? svgMatch[0] : 'Error'; } }).catch(() => { body.innerHTML = 'Connection error.'; }); }
 
-function doExportStats() { if (!window._telemtLastStats) { alert("Live stats not loaded yet. Wait a few seconds."); return; } fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', 'Exporting Live Stats to CSV'); return f;})() }); var csv = "username,total_dl_bytes,total_ul_bytes,active_connections\n"; var grandTx = 0, grandRx = 0, grandConns = 0; for (var u in window._telemtLastStats) { if (window._telemtLastStats.hasOwnProperty(u)) { var s = window._telemtLastStats[u]; var tx = (s.live_tx || 0) + (s.acc_tx || 0); var rx = (s.live_rx || 0) + (s.acc_rx || 0); var c = (s.conns || 0); csv += u + "," + tx + "," + rx + "," + c + "\n"; grandTx += tx; grandRx += rx; grandConns += c; } } csv += "TOTAL_ALL_USERS," + grandTx + "," + grandRx + "," + grandConns + "\n"; var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' }); var link = document.createElement("a"); link.setAttribute("href", URL.createObjectURL(blob)); link.setAttribute("download", "telemt_traffic_stats.csv"); link.style.visibility = 'hidden'; document.body.appendChild(link); link.click(); document.body.removeChild(link); }
 function doExportCSV() { fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', 'Exporting Users to CSV'); return f;})() }); var blob = new Blob(["]] .. clean_csv .. [["], { type: 'text/csv;charset=utf-8;' }); var link = document.createElement("a"); link.setAttribute("href", URL.createObjectURL(blob)); link.setAttribute("download", "telemt_users.csv"); link.style.visibility = 'hidden'; document.body.appendChild(link); link.click(); document.body.removeChild(link); }
 function readCSVFile(input) { var file = input.files[0]; var displaySpan = document.getElementById('csv_file_name_display'); if (!file) { displaySpan.innerText = "No file selected"; return; } displaySpan.innerText = file.name; var reader = new FileReader(); reader.onload = function(e) { document.getElementById('csv_text_area').value = e.target.result; }; reader.readAsText(file); }
 
@@ -1070,17 +1104,9 @@ function fixTabIsolation() {
             var topRow = document.createElement('div'); topRow.className = 'telemt-dash-top-row';
             var sumInner = document.createElement('div'); sumInner.id = 'telemt_users_summary_inner'; sumInner.className = 'telemt-dash-summary'; topRow.appendChild(sumInner);
             var btnsTop = document.createElement('div'); btnsTop.className = 'telemt-dash-btns';
-            var btnExpStat = document.createElement('input'); btnExpStat.type = 'button'; btnExpStat.className = 'cbi-button cbi-button-apply'; btnExpStat.value = 'Export Stats'; btnExpStat.addEventListener('click', doExportStats); btnsTop.appendChild(btnExpStat);
-            var btnRstStat = document.createElement('input'); btnRstStat.type = 'button'; btnRstStat.className = 'cbi-button cbi-button-remove'; btnRstStat.value = 'Reset Traffic Stats'; btnRstStat.addEventListener('click', function() { if(confirm('Clear RAM stats?')) { fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('telemt_action', 'reset_stats'); return f;})() }); } }); btnsTop.appendChild(btnRstStat);
+            var btnExpCsv = document.createElement('input'); btnExpCsv.type = 'button'; btnExpCsv.className = 'cbi-button cbi-button-action'; btnExpCsv.value = 'Export (CSV)'; btnExpCsv.addEventListener('click', doExportCSV); btnsTop.appendChild(btnExpCsv);
+            var btnImpCsv = document.createElement('input'); btnImpCsv.type = 'button'; btnImpCsv.className = 'cbi-button cbi-button-apply'; btnImpCsv.value = 'Import (CSV)'; btnImpCsv.addEventListener('click', showImportModal); btnsTop.appendChild(btnImpCsv);
             topRow.appendChild(btnsTop); dash.appendChild(topRow);
-
-            var botRow = document.createElement('div'); botRow.className = 'telemt-dash-bot-row';
-            var btnsBot = document.createElement('div'); btnsBot.className = 'telemt-action-btns';
-            var btnExpCsv = document.createElement('input'); btnExpCsv.type = 'button'; btnExpCsv.className = 'cbi-button cbi-button-action'; btnExpCsv.value = 'Export Users (CSV)'; btnExpCsv.addEventListener('click', doExportCSV); btnsBot.appendChild(btnExpCsv);
-            var btnImpCsv = document.createElement('input'); btnImpCsv.type = 'button'; btnImpCsv.className = 'cbi-button cbi-button-apply'; btnImpCsv.value = 'Import Users (CSV)'; btnImpCsv.addEventListener('click', showImportModal); btnsBot.appendChild(btnImpCsv);
-            botRow.appendChild(btnsBot); dash.appendChild(botRow);
-            
-            var warnMsg = document.createElement('div'); warnMsg.className = 'telemt-dash-warn'; warnMsg.innerText = 'Important: You must create at least one active user for the proxy to start!'; dash.appendChild(warnMsg);
             userTarget.insertBefore(dash, userTable);
         }
     }
@@ -1101,7 +1127,7 @@ function isTemplateRow(row) {
 
 function injectUI() {
     fixTabIsolation();
-    scheduleRepack(); // Initial repack trigger
+    scheduleRepack(); 
     
     var secretTh = document.querySelector('#cbi-telemt-user th[data-name="secret"]') || document.querySelector('#cbi-telemt-user .cbi-section-table-titles th:first-child') || document.querySelector('#cbi-telemt-user thead th:first-child');
     if (secretTh && !secretTh.dataset.renamed) { var txt = (secretTh.textContent || '').trim().toLowerCase(); if (txt == 'secret' || txt == 'секрет' || txt == 'name' || txt == '') { secretTh.textContent = 'User / Secret'; secretTh.dataset.renamed = "1"; } }
@@ -1115,65 +1141,25 @@ function injectUI() {
     document.querySelectorAll('#cbi-telemt-upstream .cbi-section-node:not([id*="-template"])').forEach(function(row, index) {
         if (!row.dataset.cascadeInjected) {
             row.dataset.cascadeInjected = "1";
-            
             var header = document.createElement('div');
             header.className = 'telemt-cascade-header';
             header.style.cssText = 'font-size:1.1em; font-weight:bold; color:#00a000; margin-bottom:15px; border-bottom:1px dashed rgba(0,160,0,0.4); padding-bottom:4px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; user-select:none;';
-            
-            var titleSpan = document.createElement('span');
-            header.appendChild(titleSpan);
-            var toggleSpan = document.createElement('span');
-            toggleSpan.innerHTML = '&#9660;';
-            header.appendChild(toggleSpan);
+            var titleSpan = document.createElement('span'); header.appendChild(titleSpan);
+            var toggleSpan = document.createElement('span'); toggleSpan.innerHTML = '&#9660;'; header.appendChild(toggleSpan);
             row.insertBefore(header, row.firstChild);
-            
             var updateTitle = function() {
-                var nInp = row.querySelector('input[name*=".alias"]');
-                var aInp = row.querySelector('input[name*=".address"]');
-                var tSel = row.querySelector('select[name*=".type"]');
-                var vName = (nInp && nInp.value.trim() !== "") ? nInp.value.trim() : '';
-                var vAddr = (aInp && aInp.value.trim() !== "") ? aInp.value.trim() : '';
-                var vType = (tSel && tSel.value === "direct") ? "Direct" : vAddr;
-                
-                // Using strictly ASCII characters for stability
+                var nInp = row.querySelector('input[name*=".alias"]'); var aInp = row.querySelector('input[name*=".address"]'); var tSel = row.querySelector('select[name*=".type"]');
+                var vName = (nInp && nInp.value.trim() !== "") ? nInp.value.trim() : ''; var vAddr = (aInp && aInp.value.trim() !== "") ? aInp.value.trim() : ''; var vType = (tSel && tSel.value === "direct") ? "Direct" : vAddr;
                 var text = 'Cascade #' + (index + 1);
-                if (vName || vType) {
-                    text += ' - ' + escHTML(vName ? vName : 'Unnamed');
-                    if (vType) text += ' <span style="color:#888; font-weight:normal; font-size:0.9em;">(' + escHTML(vType) + ')</span>';
-                }
+                if (vName || vType) { text += ' - ' + escHTML(vName ? vName : 'Unnamed'); if (vType) text += ' <span style="color:#888; font-weight:normal; font-size:0.9em;">(' + escHTML(vType) + ')</span>'; }
                 titleSpan.innerHTML = text;
             };
-            
-            setTimeout(updateTitle, 100);
-            row.addEventListener('input', function(e) {
-                if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) { updateTitle(); }
-            });
-            
+            setTimeout(updateTitle, 100); row.addEventListener('input', function(e) { if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) { updateTitle(); } });
             var fields = Array.from(row.children).filter(function(child) { return child !== header && !child.classList.contains('cbi-section-remove'); });
-            header.addEventListener('click', function(e) {
-                var isHidden = fields[0].style.display === 'none';
-                fields.forEach(function(f) { f.style.display = isHidden ? '' : 'none'; });
-                toggleSpan.innerHTML = isHidden ? '&#9660;' : '&#9654;';
-            });
-            
-            var parent = row.parentElement;
-            var rmDiv = parent ? (parent.querySelector(':scope > .cbi-section-remove') || null) : null;
-            if (!rmDiv) {
-                var sib = row.nextElementSibling;
-                while (sib) {
-                    if (sib.classList && sib.classList.contains('cbi-section-remove')) { rmDiv = sib; break; }
-                    sib = sib.nextElementSibling;
-                }
-            }
-            if (rmDiv) {
-                row.appendChild(rmDiv);
-                rmDiv.style.textAlign = 'left';
-                rmDiv.style.marginTop = '15px';
-                rmDiv.style.paddingTop = '15px';
-                rmDiv.style.borderTop = '1px dashed var(--border-color, rgba(128,128,128,0.3))';
-                var btnInput = rmDiv.querySelector('.cbi-button');
-                if (btnInput) { btnInput.style.float = 'none'; btnInput.style.display = 'inline-block'; }
-            }
+            header.addEventListener('click', function(e) { var isHidden = fields[0].style.display === 'none'; fields.forEach(function(f) { f.style.display = isHidden ? '' : 'none'; }); toggleSpan.innerHTML = isHidden ? '&#9660;' : '&#9654;'; });
+            var parent = row.parentElement; var rmDiv = parent ? (parent.querySelector(':scope > .cbi-section-remove') || null) : null;
+            if (!rmDiv) { var sib = row.nextElementSibling; while (sib) { if (sib.classList && sib.classList.contains('cbi-section-remove')) { rmDiv = sib; break; } sib = sib.nextElementSibling; } }
+            if (rmDiv) { row.appendChild(rmDiv); rmDiv.style.textAlign = 'left'; rmDiv.style.marginTop = '15px'; rmDiv.style.paddingTop = '15px'; rmDiv.style.borderTop = '1px dashed var(--border-color, rgba(128,128,128,0.3))'; var btnInput = rmDiv.querySelector('.cbi-button'); if (btnInput) { btnInput.style.float = 'none'; btnInput.style.display = 'inline-block'; } }
         }
     });
 
@@ -1181,56 +1167,33 @@ function injectUI() {
         if (isTemplateRow(row)) return;
         var secInp = row.querySelector('input[name*=".secret"]'); var niList = row.querySelectorAll('input[name*="max_tcp_conns"], input[name*="max_unique_ips"], input[name*="data_quota"], input[name*="expire_date"]'); var linkWrap = row.querySelector('.link-wrapper');
         if (!secInp || niList.length === 0 || !linkWrap) return; row.dataset.injected = "1";
-        
         var match = secInp.name.match(/cbid\.telemt\.([^.]+)\.secret/); var uName = match ? match[1] : '?';
         
         if (is_owrt25) {
             var secretTd = secInp.closest('td');
-            if (secretTd) {
-                var nameDiv = secretTd.querySelector('.telemt-fallback-name');
-                if (!nameDiv) { nameDiv = document.createElement('div'); nameDiv.className = 'telemt-fallback-name telemt-user-col-text'; nameDiv.style.cssText = 'margin-bottom: 6px; font-size: 1.1em; font-family: monospace; display: block; color: #005ce6 !important; font-weight: bold !important;'; secretTd.insertBefore(nameDiv, secretTd.firstChild); }
-                nameDiv.innerText = '[ user: ' + uName + ' ]'; 
-            }
+            if (secretTd) { var nameDiv = secretTd.querySelector('.telemt-fallback-name'); if (!nameDiv) { nameDiv = document.createElement('div'); nameDiv.className = 'telemt-fallback-name telemt-user-col-text'; nameDiv.style.cssText = 'margin-bottom: 6px; font-size: 1.1em; font-family: monospace; display: block; color: #005ce6 !important; font-weight: bold !important;'; secretTd.insertBefore(nameDiv, secretTd.firstChild); } nameDiv.innerText = '[ user: ' + uName + ' ]'; }
         } else {
             var firstCell = row.firstElementChild;
-            if (firstCell && !firstCell.contains(secInp)) {
-                var span = firstCell.querySelector('.telemt-user-col-text');
-                if (!span) { span = document.createElement('span'); span.className = 'telemt-user-col-text'; span.style.cssText = 'color: #005ce6 !important; font-weight: bold !important; margin-bottom: 4px; display: block;'; firstCell.insertBefore(span, firstCell.firstChild); }
-                span.innerText = uName;
-            }
+            if (firstCell && !firstCell.contains(secInp)) { var span = firstCell.querySelector('.telemt-user-col-text'); if (!span) { span = document.createElement('span'); span.className = 'telemt-user-col-text'; span.style.cssText = 'color: #005ce6 !important; font-weight: bold !important; margin-bottom: 4px; display: block;'; firstCell.insertBefore(span, firstCell.firstChild); } span.innerText = uName; }
         }
         
         if(secInp) {
             if(secInp.value.trim() === "") { secInp.value = genRandHex(); secInp.dispatchEvent(new Event('change', {bubbles: true})); }
             secInp.dataset.prevVal = secInp.value; var wrapper = document.createElement('div'); wrapper.className = 'telemt-sec-wrap'; secInp.parentNode.insertBefore(wrapper, secInp); wrapper.appendChild(secInp);
-            var grp = document.createElement('div'); grp.className = 'telemt-sec-btns'; var bG = document.createElement('input'); bG.type = 'button'; bG.className = 'cbi-button cbi-button-apply'; bG.value = 'Gen'; bG.addEventListener('click', function(){ secInp.value = genRandHex(); updateLinks(); }); var bR = document.createElement('input'); bR.type = 'button'; bR.className = 'cbi-button cbi-button-reset'; bR.value = 'Rev'; bR.addEventListener('click', function(){ secInp.value = secInp.dataset.prevVal; updateLinks(); });
-            grp.appendChild(bG); grp.appendChild(bR); wrapper.appendChild(grp);
+            var grp = document.createElement('div'); grp.className = 'telemt-sec-btns'; var bG = document.createElement('input'); bG.type = 'button'; bG.className = 'cbi-button cbi-button-apply'; bG.value = 'Gen'; bG.addEventListener('click', function(){ secInp.value = genRandHex(); updateLinks(); }); var bR = document.createElement('input'); bR.type = 'button'; bR.className = 'cbi-button cbi-button-reset'; bR.value = 'Rev'; bR.addEventListener('click', function(){ secInp.value = secInp.dataset.prevVal; updateLinks(); }); grp.appendChild(bG); grp.appendChild(bR); wrapper.appendChild(grp);
         }
         
         var cb = row.querySelector('input[type="checkbox"][name*=".enabled"]');
-        if (cb) { 
-            cb.addEventListener('change', function(e) { 
-                fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', "User " + uName + " manually " + (e.target.checked ? "Resumed" : "Paused")); return f;})() }); 
-            }); 
-        }
+        if (cb) { cb.addEventListener('change', function(e) { fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', "User " + uName + " manually " + (e.target.checked ? "Resumed" : "Paused")); return f;})() }); }); }
         
         niList.forEach(function(ni){
             var propName = ni.name.match(/([^\.]+)$/); var fName = propName ? propName[1] : "limit";
             ni.addEventListener('change', function(e) { 
                 fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', "User " + uName + " " + fName + " changed to: " + (e.target.value || "unlimited")); return f;})() });
-                if (fName === 'expire_date' || fName === 'data_quota') {
-                    if (cb && !cb.checked) {
-                        cb.checked = true;
-                        fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', "User " + uName + " auto-resumed due to " + fName + " update"); return f;})() });
-                    }
-                }
+                if (fName === 'expire_date' || fName === 'data_quota') { if (cb && !cb.checked) { cb.checked = true; fetch(lu_current_url.split('#')[0], { method: 'POST', body: (function(){var f=new FormData(); f.append('log_ui_event', '1'); f.append('msg', "User " + uName + " auto-resumed due to " + fName + " update"); return f;})() }); } }
             });
             var wrapper = document.createElement('div'); wrapper.className = 'telemt-num-wrap'; ni.parentNode.insertBefore(wrapper, ni); wrapper.appendChild(ni);
-            if(ni.name.indexOf('expire_date') !== -1) {
-                var calContainer = document.createElement('div'); calContainer.className = 'telemt-cal-wrap'; var calBtn = document.createElement('input'); calBtn.type = 'button'; calBtn.className = 'cbi-button cbi-button-action telemt-btn-cal'; calBtn.title = 'Select Date'; calBtn.value = ' ';
-                var picker = document.createElement('input'); picker.type = 'datetime-local'; picker.className = 'telemt-cal-picker'; picker.addEventListener('change', function(e) { var val = e.target.value; if(val) { var parts = val.split('T'); var dParts = parts[0].split('-'); if(dParts.length === 3) { ni.value = dParts[2] + '.' + dParts[1] + '.' + dParts[0] + ' ' + parts[1]; ni.dispatchEvent(new Event('change', {bubbles:true})); } } });
-                calContainer.appendChild(calBtn); calContainer.appendChild(picker); wrapper.appendChild(calContainer);
-            }
+            if(ni.name.indexOf('expire_date') !== -1) { var calContainer = document.createElement('div'); calContainer.className = 'telemt-cal-wrap'; var calBtn = document.createElement('input'); calBtn.type = 'button'; calBtn.className = 'cbi-button cbi-button-action telemt-btn-cal'; calBtn.title = 'Select Date'; calBtn.value = ' '; var picker = document.createElement('input'); picker.type = 'datetime-local'; picker.className = 'telemt-cal-picker'; picker.addEventListener('change', function(e) { var val = e.target.value; if(val) { var parts = val.split('T'); var dParts = parts[0].split('-'); if(dParts.length === 3) { ni.value = dParts[2] + '.' + dParts[1] + '.' + dParts[0] + ' ' + parts[1]; ni.dispatchEvent(new Event('change', {bubbles:true})); } } }); calContainer.appendChild(calBtn); calContainer.appendChild(picker); wrapper.appendChild(calContainer); }
             var bD = document.createElement('input'); bD.type = 'button'; bD.className = 'cbi-button cbi-button-reset telemt-btn-cross'; bD.title = 'Reset value'; bD.value = ' '; bD.addEventListener('click', function(){ ni.value = ''; ni.dispatchEvent(new Event('change', {bubbles:true})); }); wrapper.appendChild(bD);
         });
         
@@ -1239,35 +1202,44 @@ function injectUI() {
 }
 
 var metricsTimer = null; var fwTimer = null;
-function startTimers() { if (!metricsTimer) metricsTimer = setInterval(fetchMetrics, 2500); if (!fwTimer) fwTimer = setInterval(updateFWStatus, 15000); }
-function stopTimers() { if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null; } if (fwTimer) { clearInterval(fwTimer); fwTimer = null; } }
 
-document.addEventListener('visibilitychange', function () { if (document.hidden) { stopTimers(); } else { window._telemtLastTime = 0; fetchMetrics(); updateFWStatus(); startTimers(); } });
+function schedulePoll() {
+    if (window._telemtFetching) return;
+    fetchMetrics().finally(function() {
+        if (metricsTimer !== null) { metricsTimer = setTimeout(schedulePoll, 2500); }
+    });
+}
+
+function startTimers() { 
+    if (metricsTimer === null) { metricsTimer = setTimeout(schedulePoll, 2500); schedulePoll(); } 
+    if (!fwTimer) fwTimer = setInterval(updateFWStatus, 15000); 
+}
+
+function stopTimers() { 
+    if (metricsTimer !== null) { clearTimeout(metricsTimer); metricsTimer = null; } 
+    if (fwTimer) { clearInterval(fwTimer); fwTimer = null; } 
+}
+
+document.addEventListener('visibilitychange', function () { if (document.hidden) { stopTimers(); } else { window._telemtLastTime = 0; updateFWStatus(); startTimers(); } });
 document.addEventListener('input', function(e) { if (e.target && e.target.matches('input, select')) { if(e.target.id === 'telemt_mirror_ip') { var master = document.querySelector('input[name*="cbid.telemt.general.external_ip"]'); if(master) { master.value = e.target.value; master.dispatchEvent(new Event('change')); } } else if (e.target.name && e.target.name.indexOf('cbid.telemt.general.external_ip') > -1) { var mirror = document.getElementById('telemt_mirror_ip'); if(mirror) mirror.value = e.target.value; } updateLinks(); } });
 
 function initTelemt() {
-    injectUI(); updateLinks(); updateFWStatus(); fetchMetrics(); 
+    injectUI(); updateLinks(); updateFWStatus(); startTimers();
     setTimeout(function(){ injectUI(); updateLinks(); }, 200); 
     setTimeout(function(){ injectUI(); updateLinks(); updateFWStatus(); }, 1200); 
-    if (window.location.search.indexOf('import_ok=') > -1) { var match = window.location.search.search(/import_ok=(\d+)/); if (match && match[1]) { setTimeout(function() { alert("Successfully imported " + match[1] + " users from CSV!"); }, 300); if (window.history && window.history.replaceState) { window.history.replaceState({}, document.title, window.location.protocol + "//" + window.location.host + window.location.pathname); } } }
+    if (window.location.search.indexOf('import_ok=') > -1) { var match = window.location.search.match(/import_ok=(\d+)/); if (match && match[1]) { setTimeout(function() { alert("Successfully imported " + match[1] + " users from CSV!"); }, 300); if (window.history && window.history.replaceState) { window.history.replaceState({}, document.title, window.location.protocol + "//" + window.location.host + window.location.pathname); } } }
     
-    // SAFE MUTATION OBSERVER WITH DEBOUNCED REPACKING
     if (typeof window.MutationObserver !== 'undefined') { 
         var _injecting = false; 
         var domObserver = new MutationObserver(function(mutations) { 
-            scheduleRepack(); // Quietly schedule repack without blocking UI thread
+            scheduleRepack(); 
             if (_injecting) return; 
             var needsUpdate = false; 
-            for (var i = 0; i < mutations.length; i++) { 
-                if (mutations[i].target.id === 'cbi-telemt-user' || mutations[i].target.id === 'cbi-telemt-upstream' || (mutations[i].target.closest && mutations[i].target.closest('#cbi-telemt-user'))) { needsUpdate = true; break; } 
-            } 
+            for (var i = 0; i < mutations.length; i++) { if (mutations[i].target.id === 'cbi-telemt-user' || mutations[i].target.id === 'cbi-telemt-upstream' || (mutations[i].target.closest && mutations[i].target.closest('#cbi-telemt-user'))) { needsUpdate = true; break; } } 
             if (needsUpdate) { _injecting = true; injectUI(); updateLinks(); _injecting = false; } 
         }); 
         domObserver.observe(document.getElementById('maincontent') || document.body, { childList: true, subtree: true }); 
-    } else { 
-        setInterval(function(){ injectUI(); updateLinks(); scheduleRepack(); }, 2500); 
-    }
-    startTimers();
+    } else { setInterval(function(){ injectUI(); updateLinks(); scheduleRepack(); }, 2500); }
 }
 if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', initTelemt); } else { initTelemt(); }
 </script>
