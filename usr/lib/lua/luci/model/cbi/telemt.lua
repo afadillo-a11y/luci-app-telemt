@@ -211,8 +211,8 @@ end
 if http.formvalue("get_log") == "1" then
     http.prepare_content("text/plain")
     -- ANSI STRIP FIX: %a correctly removes ALL CSI codes including cursor movements (\e[K)
-    -- GREP EXPANSION: Catch OOM killer and Firewall activities
-    local log_data = sys.exec("logread 2>/dev/null | grep -iE 'telemt|mtproxy|sing-box|Allow-Telemt|nf_conntrack|Out\\.of\\.memory' | tail -n 100")
+    -- LOGREAD FIX: Certain OpenWrt versions lack egrep, fallback to basic logread -e
+    local log_data = sys.exec("logread -e telemt 2>/dev/null | tail -n 100")
     if not log_data or log_data:gsub("%s+", "") == "" then log_data = "No logs found." end
     pcall(function() http.write(log_data:gsub("\27%[[%d;]*%a", "")) end); end_ajax(); return
 end
@@ -731,7 +731,8 @@ function updateCascadesState() {
 function setOfflineState() {
     var sEl = document.getElementById('dash_status'); if(sEl) { sEl.innerText = 'STOPPED'; sEl.style.color = '#d9534f'; }
     var rEl = document.getElementById('dash_rss'); if(rEl) { rEl.innerText = '0 MB'; rEl.style.color = '#888'; }
-    document.querySelectorAll('.user-flat-stat').forEach(function(el) { el.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ Offline ]</span>"; });
+    // UX FIX: We no longer forcefully overwrite user badges with [ Offline ] here,
+    // so they can show accumulated stats while the proxy is stopped.
     
     var sumEl = document.getElementById('telemt_users_summary_inner');
     if (sumEl) sumEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>Status: Daemon Stopped</span>";
@@ -789,7 +790,7 @@ function renderHealthGrid(apiData, promText) {
     var promUpActive = upActiveMatch ? upActiveMatch[1] : '0';
     var promUpFails = upFailsMatch ? upFailsMatch[1] : '0';
 
-    var promBadges = '<span class="badge badge-err">DPI Probes: ' + probes + '</span><span class="badge badge-err">Rejected/Scans: ' + scans + '</span>';
+    var promBadges = '<span class="badge badge-err" title="Number of detected Deep Packet Inspection probes">DPI Probes: ' + probes + '</span><span class="badge badge-err" title="Connections rejected or actively scanned">Rejected/Scans: ' + scans + '</span>';
 
     var parsed = parseApiResponse(apiData);
     var rt = parsed.runtime;
@@ -799,8 +800,8 @@ function renderHealthGrid(apiData, promText) {
     if (!apiOk || !rt) {
         var hasAnyProm = promText.indexOf('telemt_') > -1;
         var apiMsg = hasAnyProm 
-            ? '<span class="badge badge-err">Control API: Offline</span><span style="font-size:0.85em; color:#888; display:block; margin-top:5px;">API port не отвечает. Проверьте api_port и extended_runtime_enabled.</span>'
-            : '<span class="badge badge-err">Daemon: No Metrics</span>';
+            ? '<span class="badge badge-gray" title="Control API is disabled or not responding. Basic stats are still shown from Prometheus.">Control API: Disabled</span>'
+            : '<span class="badge badge-err" title="telemt daemon is not returning any metrics!">Daemon: No Metrics</span>';
         
         if(dg) dg.innerHTML = apiMsg + promBadges;
         if(dUp) dUp.innerHTML = '<div style="color:#888; padding:10px;"><b>Detailed tables require Control API.</b><br><br><b>Active Connects:</b> ' + promUpActive + ' | <b>Fails:</b> ' + promUpFails + '</div>';
@@ -809,16 +810,19 @@ function renderHealthGrid(apiData, promText) {
     }
     
     var mode = rt.route_mode || "direct";
-    var meRdy = rt.me_runtime_ready ? '<span class="badge badge-ok">ME: Ready</span>' : '<span class="badge badge-gray">ME: Disabled</span>';
-    // PATCH 3.3.16: me2dc_fallback_enabled does NOT exist in API (model.rs verified).
-    // Real signal: any writer with degraded=true means fallback/reroute is active.
+    var meRdy = rt.me_runtime_ready ? '<span class="badge badge-ok" title="Middle-End Proxy is actively communicating with Telegram DCs">ME: Ready</span>' : '<span class="badge badge-gray" title="Middle-End Proxy is not enabled in backend">ME: Disabled</span>';
     var _meWr = (st && st.me_writers && Array.isArray(st.me_writers.writers)) ? st.me_writers.writers : [];
     var _hasDegraded = _meWr.some(function(w){ return w && w.degraded; });
-    var fb = _hasDegraded ? '<span class="badge badge-err">Fallback: ON</span>' : '<span class="badge badge-ok">Fallback: OFF</span>';
-    var rroute = rt.reroute_active ? '<span class="badge badge-err">Reroute: ON</span>' : '<span class="badge badge-ok">Reroute: OFF</span>';
-    var acc = rt.accepting_new_connections ? '<span class="badge badge-ok">Accepting</span>' : '<span class="badge badge-err">Rejecting</span>';
+    var fb = _hasDegraded ? '<span class="badge badge-err" title="ME endpoints failed, traffic is falling back to Direct DC connections!">Fallback: ON</span>' : '<span class="badge badge-ok" title="Routing normally without degradation">Fallback: OFF</span>';
+    var rroute = rt.reroute_active ? '<span class="badge badge-err" title="Traffic is being rerouted due to failures!">Reroute: ON</span>' : '<span class="badge badge-ok" title="No active reroutes">Reroute: OFF</span>';
+    var acc = rt.accepting_new_connections ? '<span class="badge badge-ok" title="Proxy is accepting client connections">Accepting</span>' : '<span class="badge badge-err" title="Proxy is rejecting new connections">Rejecting</span>';
     
-    if(dg) dg.innerHTML = '<span class="badge ' + (mode==='middle'?'badge-ok':'badge-gray') + '">Mode: ' + escHTML(mode) + '</span>' + meRdy + fb + rroute + acc + promBadges;
+    var dcsCount = 0;
+    if (st && st.dcs && typeof st.dcs === 'object' && Array.isArray(st.dcs.dcs)) { dcsCount = st.dcs.dcs.length; } 
+    else if (st && Array.isArray(st.dcs)) { dcsCount = st.dcs.length; }
+    var dcsBadge = '<span class="badge badge-ok" title="Number of Telegram Datacenters currently visible to the backend">DCs: ' + dcsCount + '</span>';
+    
+    if(dg) dg.innerHTML = '<span class="badge ' + (mode==='middle'?'badge-ok':'badge-gray') + '" title="Current routing mode. Direct = direct connection to Telegram.">Mode: ' + escHTML(mode) + '</span>' + meRdy + fb + rroute + dcsBadge + acc + promBadges;
     
     if (dUp) {
         if (st && st.upstreams && Array.isArray(st.upstreams) && st.upstreams.length > 0) {
@@ -959,11 +963,13 @@ function fetchMetrics() {
             if (isExpired) { statEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ EXPIRED ]</span>"; return; }
             if (isOverQuota) { statEl.innerHTML = "<span style='color:#d9534f; font-weight:bold;'>[ QUOTA ]</span>"; return; }
             if (isEn === "0" || (cb && !cb.checked)) { statEl.innerHTML = "<span style='color:#888; font-weight:bold;'>[ PAUSED ]</span>"; return; }
-            if (isOffline) { statEl.innerHTML = "<span style='color:#888;'>Offline (DL: " + formatMB(finalTx) + ")</span>"; return; }
+            // removed the aggressive string overwriting on isOffline so we can show dim stats
             
             var c_col = stat.conns > 0 ? "#00a000" : "#888"; 
             var dotUser = "<svg width='10' height='10' style='vertical-align:middle;'><circle cx='5' cy='5' r='5' fill='" + c_col + "'/></svg>";
-            statEl.innerHTML = "<div style='display:flex; align-items:center; gap:4px; margin-bottom:2px; flex-wrap:wrap;'><span style='color:#00a000;'>&darr; " + formatMB(finalTx) + "</span> <span class='stat-divider'>/</span> <span style='color:#d35400;'>&uarr; " + formatMB(finalRx) + "</span> <span class='stat-divider'>|</span> <span style='color:" + c_col + ";'>" + dotUser + "&nbsp;" + stat.conns + "&nbsp;<small>conns</small></span></div>";
+            var statHtml = "<div style='display:flex; align-items:center; gap:4px; margin-bottom:2px; flex-wrap:wrap;'><span style='color:#00a000;' title='Total Download (Live + Accumulated)'>&darr; " + formatMB(finalTx) + "</span> <span class='stat-divider'>/</span> <span style='color:#d35400;' title='Total Upload (Live + Accumulated)'>&uarr; " + formatMB(finalRx) + "</span> <span class='stat-divider'>|</span> <span style='color:" + c_col + ";' title='Active TCP Connections'>" + dotUser + "&nbsp;" + stat.conns + "&nbsp;<small>conns</small></span></div>";
+            if (isOffline) { statEl.innerHTML = "<div style='opacity: 0.6; filter: grayscale(1);' title='Daemon is offline, but showing accumulated stats'>" + statHtml + "</div>"; } 
+            else { statEl.innerHTML = statHtml; }
         });
         
         var now = Date.now(); var speedDL = 0, speedUL = 0; 
@@ -1126,6 +1132,7 @@ function fixTabIsolation() {
             var topRow = document.createElement('div'); topRow.className = 'telemt-dash-top-row';
             var sumInner = document.createElement('div'); sumInner.id = 'telemt_users_summary_inner'; sumInner.className = 'telemt-dash-summary'; topRow.appendChild(sumInner);
             var btnsTop = document.createElement('div'); btnsTop.className = 'telemt-dash-btns';
+            var btnResetStats = document.createElement('input'); btnResetStats.type = 'button'; btnResetStats.className = 'cbi-button cbi-button-remove'; btnResetStats.value = 'Reset Stats'; btnResetStats.title = 'Clear all accumulated user traffic statistics'; btnResetStats.addEventListener('click', function(){ if(confirm('Are you sure you want to completely clear ALL accumulated user traffic statistics?')) { postAction('reset_stats'); } }); btnsTop.appendChild(btnResetStats);
             var btnExpCsv = document.createElement('input'); btnExpCsv.type = 'button'; btnExpCsv.className = 'cbi-button cbi-button-action'; btnExpCsv.value = 'Export (CSV)'; btnExpCsv.addEventListener('click', doExportCSV); btnsTop.appendChild(btnExpCsv);
             var btnImpCsv = document.createElement('input'); btnImpCsv.type = 'button'; btnImpCsv.className = 'cbi-button cbi-button-apply'; btnImpCsv.value = 'Import (CSV)'; btnImpCsv.addEventListener('click', showImportModal); btnsTop.appendChild(btnImpCsv);
             topRow.appendChild(btnsTop); dash.appendChild(topRow);
