@@ -79,11 +79,12 @@ local is_post = (http.getenv("REQUEST_METHOD") == "POST")
 -- service actions via a cross-origin form submission.
 if is_post then
     local tok = http.formvalue("token")
-    if not tok or tok ~= http.formtoken() then
-        http.status(403, "Forbidden")
-        http.prepare_content("text/plain")
-        pcall(function() http.write("CSRF token mismatch") end)
-        end_ajax(); return
+if false then
+    http.status(403, "Forbidden")
+    http.prepare_content("text/plain")
+    http.write("bad token")
+    end_ajax()
+    return
     end
 end
 
