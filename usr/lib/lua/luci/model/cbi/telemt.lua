@@ -148,14 +148,6 @@ if http.formvalue("get_bot_status") == "1" then
 
     local status_json = '{"pid":"' .. pid .. '"'
     if pid ~= "" then
-        local rss = "0"
-        local sf = io.open("/proc/" .. pid .. "/status", "r")
-        if sf then
-            local stxt = sf:read("*all") or ""; sf:close()
-            rss = stxt:match("VmRSS:%s+(%d+)") or "0"
-        end
-        local rss_mb = tostring(math.floor(tonumber(rss) / 1024))
-
         local route = "unknown"
         local hf = io.open("/tmp/telemt_health_state", "r")
         if hf then
@@ -167,8 +159,7 @@ if http.formvalue("get_bot_status") == "1" then
             elseif socks_st == "no_curl" then route = "direct"
             end
         end
-
-        status_json = status_json .. ',"running":true,"rss_mb":"' .. rss_mb .. '","route":"' .. route .. '"'
+        status_json = status_json .. ',"running":true,"route":"' .. route .. '"'
     else
         status_json = status_json .. ',"running":false'
     end
@@ -821,9 +812,6 @@ bot_dash.default = string.format([[
         <b>Service:</b> <span id="bot_dash_status" style="color:#888; font-weight:bold;">CHECKING...</span>
         &nbsp;<span id="bot_dash_pid" style="color:#666; font-size:0.9em;"></span>
     </div>
-    <div style="margin-bottom:4px;">
-        <b>Memory:</b> Bot RSS: <b id="bot_dash_rss" style="color:#00a000;">--</b>
-    </div>
     <div style="margin-bottom:8px;">
         <b>Route:</b> <span id="bot_dash_route" style="font-weight:bold;">--</span>
         <span id="bot_dash_route_hint" style="font-size:0.8em; color:#888; margin-left:6px;"></span>
@@ -881,14 +869,12 @@ bot_dash.default = string.format([[
         .then(function(d){
             var stEl = document.getElementById('bot_dash_status');
             var pidEl = document.getElementById('bot_dash_pid');
-            var rssEl = document.getElementById('bot_dash_rss');
             var routeEl = document.getElementById('bot_dash_route');
             var hintEl = document.getElementById('bot_dash_route_hint');
 
             if (d.running) {
                 if (stEl) { stEl.innerText = 'RUNNING'; stEl.style.color = '#00a000'; }
                 if (pidEl) pidEl.innerText = '(PID: ' + d.pid + ')';
-                if (rssEl) rssEl.innerText = (d.rss_mb || '0') + ' MB';
 
                 var routeColor = '#00a000';
                 var routeText = d.route || 'unknown';
@@ -901,7 +887,6 @@ bot_dash.default = string.format([[
             } else {
                 if (stEl) { stEl.innerText = 'STOPPED'; stEl.style.color = '#d9534f'; }
                 if (pidEl) pidEl.innerText = '';
-                if (rssEl) rssEl.innerText = '--';
                 if (routeEl) { routeEl.innerText = '--'; routeEl.style.color = '#888'; }
                 if (hintEl) hintEl.innerText = '';
             }
