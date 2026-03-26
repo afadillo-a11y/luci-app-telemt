@@ -205,7 +205,7 @@ apk add --allow-untrusted luci-app-telemt_3.3.30_noarch.apk
     </td>
     <td width="50%" valign="top" align="center" style="border: none; padding: 10px;">
       <small><b>Users Management & Hot-Reload</b></small><br><br>
-      <img src="[https://github.com/user-attachments/assets/44e4590b-733c-44f9-abc1-806c8dc3ae70](https://github.com/user-attachments/assets/9078fcab-57cf-497f-8ad2-e1687de7be82)" width="100%" alt="Users" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+      <img src="https://github.com/user-attachments/assets/9078fcab-57cf-497f-8ad2-e1687de7be82" width="100%" alt="Users" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
     </td>
   </tr>
   <tr>
