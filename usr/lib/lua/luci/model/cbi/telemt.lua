@@ -356,6 +356,8 @@ if http.formvalue("get_log") == "1" then
         log_data = "No logs found."
     else
         log_data = log_data:gsub("\27%[%d+;?%d*m", "")
+        local cut = log_data:find("<!DOCTYPE", 1, true) or log_data:find("<html", 1, true) or log_data:find("<!-- Lua compatibility mode active:", 1, true)
+        if cut and cut > 1 then log_data = log_data:sub(1, cut - 1):gsub("%s+$", "") end
     end
     pcall(function() http.write(log_data) end); end_ajax(); return
 end
@@ -1210,7 +1212,7 @@ function formatMB(bytes) { if(!bytes || bytes === 0) return '0.00 MB'; var mb = 
 function formatUptime(secs) { if(!secs) return '0s'; var d = Math.floor(secs/86400), h = Math.floor((secs%86400)/3600), m = Math.floor((secs%3600)/60), s = Math.floor(secs%60); var str = ""; if(d>0) str += d+"d "; if(h>0 || d>0) str += h+"h "; str += m+"m "+s+"s"; return str; }
 
 // ONLY use cleanResponse for Prometheus parsing. Log content bypasses this to preserve HTTP artifacts.
-function cleanResponse(txt) { if (!txt) return ''; var cut = txt.search(/<(!DOCTYPE|html[\s>])/i); if (cut > 0) return txt.substring(0, cut).trim(); return txt; }
+function cleanResponse(txt) { if (!txt) return ''; var m = txt.search(/<(!DOCTYPE|html[\s>]|!--\s*Lua compatibility mode active:)/i); if (m > 0) return txt.substring(0, m).trim(); return txt; }
 
 // -----------------------------------------------------------------------------
 // DEBOUNCED SPOILER REPACKER
@@ -1820,9 +1822,6 @@ function fetchMetrics() {
     }).catch(err => {
         window._telemtFetching = false;
         if (err && err.name === 'AbortError') { console.warn('[Telemt] Metrics fetch timeout, skipping update'); return; }
-        setOfflineState();
-        var sEl = document.getElementById('dash_status');
-        if (sEl) { sEl.innerText = 'STOPPED / CONNECTION LOST'; sEl.style.color = '#d9534f'; }
     }).finally(() => {
         window._telemtFetching = false;
     });
@@ -1876,8 +1875,7 @@ function loadLog() {
     fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_log=1&_t=' + Date.now())
     .then(r => r.text()).then(txt => {
         txt = txt || '';
-        var htmlTail = txt.lastIndexOf('<!DOCTYPE');
-        if (htmlTail > 0 && htmlTail > txt.length * 0.8) { txt = txt.substring(0, htmlTail).trim(); }
+        txt = cleanResponse(txt).replace(/<!--\s*Lua compatibility mode active:[\s\S]*$/i, '').trim();
         // Strip binary ISO timestamp (e.g. "2026-03-16T11:13:16.717471Z ") — logread already prefixes date+time
         txt = txt.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s*/g, '');
         document.getElementById('telemt_log_container').textContent = txt || 'No logs found.';
