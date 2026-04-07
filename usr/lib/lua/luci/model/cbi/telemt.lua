@@ -1,22 +1,10 @@
--- -- ==============================================================================
+-- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.3.30
--- Changes from 3.3.29:
+-- Version: 3.3.30-fix
+-- Changes from 3.3.22:
 --   - Self-Stealth: mask_port and mask_host fields on General tab
 --   - Shadowsocks upstream type with SIP002 URL field
 --   - All version strings bumped to 3.3.30
--- Earlier: Version: 3.3.29
--- Changes from 3.3.21:
---   - Dark theme fix: replaced hardcoded color:#555/#888 with inherit/opacity
---   - Users & Upstreams tabs: "Active" column → "On" (saves width, tooltips preserved)
---   - Diagnostics: live connections counter (from Prometheus)
---   - Diagnostics: per-DC latency in Upstreams card (from /v1/runtime/upstream_quality)
---   - Diagnostics: formatted Beobachten scanner output (parsed categories)
---   - Diagnostics: Runtime Info human-readable (system/gates/events in log terminal)
---   - Users tab: IP address list tooltip on hover (from /v1/users API)
---   - Upstreams tab: runtime health badge per upstream (healthy/fails/latency)
---
---   - Built by vibing bears with tears and honey for OpenWrt (21.02 — 25.x) 🐻🍯
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -37,8 +25,10 @@ local function get_proxy_pid()
 end
 
 local function end_ajax()
+    -- FIX 3.3.30: Do NOT call http.close() — on OpenWrt 24.10+ uhttpd may truncate
+    -- the response body if the socket is closed before the kernel buffer flushes.
+    -- Setting dispatched=true is sufficient to prevent LuCI from rendering HTML wrapper.
     pcall(function() if dsp.context then dsp.context.dispatched = true end end)
-    pcall(function() http.close() end)
 end
 
 local function has_cmd(c) return (sys.call("command -v " .. c .. " >/dev/null 2>&1") == 0) end
@@ -215,7 +205,11 @@ if is_post and http.formvalue("export_config") == "1" then
     if conf == "" then conf = "# telemt.toml not found or empty\n" end
     http.prepare_content("application/toml")
     http.header("Content-Disposition", "attachment; filename=\"telemt.toml\"")
-    pcall(function() http.write(conf) end); end_ajax(); return
+    -- FIX: Do NOT call end_ajax()/http.close() for file downloads — uhttpd on 24.10+
+    -- may truncate response if socket is closed before buffer flush completes.
+    pcall(function() http.write(conf) end)
+    pcall(function() if dsp.context then dsp.context.dispatched = true end end)
+    return
 end
 
 if http.formvalue("get_fw_status") == "1" then
@@ -572,15 +566,25 @@ setTimeout(function(){
 }, 500);
 </script>]], current_url)
 
+-- Server-side PID check for initial page render (3.1.2-style fallback safety net).
+-- JS polling will update this live, but if JS fails, user still sees truthful status.
+local _init_pid = get_proxy_pid()
+local _init_status_text = "STOPPED"
+local _init_status_color = "#d9534f"
+if _init_pid ~= "" then
+    _init_status_text = "RUNNING (PID: " .. _init_pid .. ")"
+    _init_status_color = "#00a000"
+end
+
 local st_html = string.format([[
 <div style="font-family:monospace; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.2); border-radius:6px; padding:12px; line-height:1.6;">
-    <div style="margin-bottom:4px;"><b>Service:</b> <span id="dash_status" style="color:#888;font-weight:bold;">PENDING...</span> &nbsp;<span id="dash_uptime" style="color:#666; font-size:0.9em;"></span></div>
+    <div style="margin-bottom:4px;"><b>Service:</b> <span id="dash_status" style="color:%s;font-weight:bold;">%s</span> &nbsp;<span id="dash_uptime" style="color:#666; font-size:0.9em;"></span></div>
     <div style="margin-bottom:8px;"><b>Memory :</b> Telemt RSS: <b id="dash_rss" style="color:#00a000;">--</b> &nbsp;|&nbsp; RAM Free: <b id="dash_ram" style="color:#555;">--</b></div>
     <div style="padding-top:8px; border-top:1px dashed rgba(128,128,128,0.2);">
         <b>Binary :</b> <span style="color:#555;">%s (v%s)</span> &nbsp;%s
     </div>
 </div>
-]], bin_path ~= "" and bin_path or "Missing", bin_ver, comp_badge)
+]], _init_status_color, _init_status_text, bin_path ~= "" and bin_path or "Missing", bin_ver, comp_badge)
 
 local st = s:taboption("general", DummyValue, "_status", "System Dashboard")
 st.rawhtml = true
