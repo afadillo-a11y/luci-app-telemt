@@ -21,7 +21,7 @@ on:
       version:
         description: 'Package version (e.g. 3.3.XX-11 or 3.3.XX)'
         required: true
-        default: '3.3.22'
+        default: '3.3.31'
 
 jobs:
   release:
