@@ -1,5 +1,5 @@
 # ==============================================================================
-# nFPM Build Configuration — luci-app-telemt v3.3.30
+# nFPM Build Configuration — luci-app-telemt v3.3.31
 # Defines package metadata, architecture, and dependencies for IPK/APK builds.
 # ==============================================================================
 name: "luci-app-telemt"
@@ -8,7 +8,7 @@ version: "3.3.31"
 section: "net"
 maintainer: "Medvedolog <Medvedolog@github.com>"
 description: |
-  LuCI WebUI for Telemt MTProxy (v3.3.30).
+  LuCI WebUI for Telemt MTProxy (v3.3.31).
   Features: Strict UCI mode, Zero-CORS API proxy, Self-Stealth mask, Shadowsocks upstream,
   Dark theme support, Graceful degradation, and OpenWrt 25+ CSR support.
 depends:
