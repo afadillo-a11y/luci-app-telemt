@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.3.30-fix
+-- Version: 3.3.31
 -- Changes from 3.3.22:
 --   - Self-Stealth: mask_port and mask_host fields on General tab
 --   - Shadowsocks upstream type with SIP002 URL field
@@ -25,7 +25,7 @@ local function get_proxy_pid()
 end
 
 local function end_ajax()
-    -- FIX 3.3.30: Do NOT call http.close() — on OpenWrt 24.10+ uhttpd may truncate
+    -- FIX 3.3.31: Do NOT call http.close() — on OpenWrt 24.10+ uhttpd may truncate
     -- the response body if the socket is closed before the kernel buffer flushes.
     -- Setting dispatched=true is sufficient to prevent LuCI from rendering HTML wrapper.
     pcall(function() if dsp.context then dsp.context.dispatched = true end end)
