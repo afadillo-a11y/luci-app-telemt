@@ -1,10 +1,24 @@
--- ==============================================================================
+-- -- ==============================================================================
 -- Telemt CBI Model (Configuration Binding Interface)
--- Version: 3.3.31
--- Changes from 3.3.22:
---   - Self-Stealth: mask_port and mask_host fields on General tab
---   - Shadowsocks upstream type with SIP002 URL field
---   - All version strings bumped to 3.3.30
+-- Version: 3.4.0
+-- Changes from 3.3.31:
+--   - metrics_listen_addr / api_listen_addr (external metrics/API bind, default loopback)
+--   - client_mss (3.4.18) global TCP MSS clamp in [server]
+--   - mask_dynamic (3.4.18) surfaced as Flag in [censorship]
+--   - Argon/AJAX-theme bootstrap fix (status panel no longer stuck on PENDING)
+--   - All version strings bumped to 3.4.0; requires telemt v3.4.15+
+-- Earlier: Version: 3.3.29
+-- Changes from 3.3.21:
+--   - Dark theme fix: replaced hardcoded color:#555/#888 with inherit/opacity
+--   - Users & Upstreams tabs: "Active" column → "On" (saves width, tooltips preserved)
+--   - Diagnostics: live connections counter (from Prometheus)
+--   - Diagnostics: per-DC latency in Upstreams card (from /v1/runtime/upstream_quality)
+--   - Diagnostics: formatted Beobachten scanner output (parsed categories)
+--   - Diagnostics: Runtime Info human-readable (system/gates/events in log terminal)
+--   - Users tab: IP address list tooltip on hover (from /v1/users API)
+--   - Upstreams tab: runtime health badge per upstream (healthy/fails/latency)
+--
+--   - Built by vibing bears with tears and honey for OpenWrt (21.02 — 25.x) 🐻🍯
 -- ==============================================================================
 
 local sys = require "luci.sys"
@@ -25,10 +39,8 @@ local function get_proxy_pid()
 end
 
 local function end_ajax()
-    -- FIX 3.3.31: Do NOT call http.close() — on OpenWrt 24.10+ uhttpd may truncate
-    -- the response body if the socket is closed before the kernel buffer flushes.
-    -- Setting dispatched=true is sufficient to prevent LuCI from rendering HTML wrapper.
     pcall(function() if dsp.context then dsp.context.dispatched = true end end)
+    pcall(function() http.close() end)
 end
 
 local function has_cmd(c) return (sys.call("command -v " .. c .. " >/dev/null 2>&1") == 0) end
@@ -190,7 +202,7 @@ end
 if is_post and http.formvalue("reset_config") == "1" then
     sys.call("logger -t telemt 'WebUI: FACTORY RESET ALL SETTINGS'")
     local default_uci =
-    "config telemt 'general'\n\toption enabled '0'\n\toption mode 'tls'\n\toption domain 'google.com'\n\toption port '8443'\n\toption metrics_port '9092'\n\toption api_port '9091'\n\toption extended_runtime_enabled '1'\n\toption metrics_allow_lo '1'\n\toption metrics_allow_lan '1'\n\toption log_level 'normal'\n"
+    "config telemt 'general'\n\toption enabled '0'\n\toption mode 'tls'\n\toption domain 'google.com'\n\toption port '8443'\n\toption metrics_port '9092'\n\toption api_port '9091'\n\toption metrics_listen_addr '127.0.0.1'\n\toption api_listen_addr '127.0.0.1'\n\toption extended_runtime_enabled '1'\n\toption metrics_allow_lo '1'\n\toption metrics_allow_lan '1'\n\toption mask_dynamic '1'\n\toption client_mss ''\n\toption log_level 'normal'\n"
     local f = io.open("/tmp/telemt_reset.tmp", "w")
     if f then
         f:write(default_uci); f:close()
@@ -205,11 +217,7 @@ if is_post and http.formvalue("export_config") == "1" then
     if conf == "" then conf = "# telemt.toml not found or empty\n" end
     http.prepare_content("application/toml")
     http.header("Content-Disposition", "attachment; filename=\"telemt.toml\"")
-    -- FIX: Do NOT call end_ajax()/http.close() for file downloads — uhttpd on 24.10+
-    -- may truncate response if socket is closed before buffer flush completes.
-    pcall(function() http.write(conf) end)
-    pcall(function() if dsp.context then dsp.context.dispatched = true end end)
-    return
+    pcall(function() http.write(conf) end); end_ajax(); return
 end
 
 if http.formvalue("get_fw_status") == "1" then
@@ -356,8 +364,6 @@ if http.formvalue("get_log") == "1" then
         log_data = "No logs found."
     else
         log_data = log_data:gsub("\27%[%d+;?%d*m", "")
-        local cut = log_data:find("<!DOCTYPE", 1, true) or log_data:find("<html", 1, true) or log_data:find("<!-- Lua compatibility mode active:", 1, true)
-        if cut and cut > 1 then log_data = log_data:sub(1, cut - 1):gsub("%s+$", "") end
     end
     pcall(function() http.write(log_data) end); end_ajax(); return
 end
@@ -492,7 +498,7 @@ if bin_path ~= "" then
 end
 
 m = Map("telemt", "Telegram Proxy (MTProto)",
-    [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.3.30</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.3.15+</span>]])
+    [[Multi-user proxy server based on <a href="https://github.com/telemt/telemt" target="_blank" style="text-decoration:none; color:inherit; font-weight:bold; border-bottom: 1px dotted currentColor;">telemt</a>.<br><b>LuCI App Version: <a href="https://github.com/Medvedolog/luci-app-telemt" target="_blank" style="text-decoration:none; color:inherit; border-bottom: 1px dotted currentColor;">3.4.0</a></b> | <span style='color:#d35400; font-weight:bold;'>Requires telemt v3.4.15+</span>]])
 m.on_commit = function(self)
     sys.call(
         "logger -t telemt 'WebUI: Config saved. Dumping stats before procd reload...'; /etc/init.d/telemt run_save_stats 2>/dev/null")
@@ -568,25 +574,15 @@ setTimeout(function(){
 }, 500);
 </script>]], current_url)
 
--- Server-side PID check for initial page render (3.1.2-style fallback safety net).
--- JS polling will update this live, but if JS fails, user still sees truthful status.
-local _init_pid = get_proxy_pid()
-local _init_status_text = "STOPPED"
-local _init_status_color = "#d9534f"
-if _init_pid ~= "" then
-    _init_status_text = "RUNNING (PID: " .. _init_pid .. ")"
-    _init_status_color = "#00a000"
-end
-
 local st_html = string.format([[
 <div style="font-family:monospace; background:rgba(128,128,128,0.05); border:1px solid rgba(128,128,128,0.2); border-radius:6px; padding:12px; line-height:1.6;">
-    <div style="margin-bottom:4px;"><b>Service:</b> <span id="dash_status" style="color:%s;font-weight:bold;">%s</span> &nbsp;<span id="dash_uptime" style="color:#666; font-size:0.9em;"></span></div>
+    <div style="margin-bottom:4px;"><b>Service:</b> <span id="dash_status" style="color:#888;font-weight:bold;">PENDING...</span> &nbsp;<span id="dash_uptime" style="color:#666; font-size:0.9em;"></span></div>
     <div style="margin-bottom:8px;"><b>Memory :</b> Telemt RSS: <b id="dash_rss" style="color:#00a000;">--</b> &nbsp;|&nbsp; RAM Free: <b id="dash_ram" style="color:#555;">--</b></div>
     <div style="padding-top:8px; border-top:1px dashed rgba(128,128,128,0.2);">
         <b>Binary :</b> <span style="color:#555;">%s (v%s)</span> &nbsp;%s
     </div>
 </div>
-]], _init_status_color, _init_status_text, bin_path ~= "" and bin_path or "Missing", bin_ver, comp_badge)
+]], bin_path ~= "" and bin_path or "Missing", bin_ver, comp_badge)
 
 local st = s:taboption("general", DummyValue, "_status", "System Dashboard")
 st.rawhtml = true
@@ -786,6 +782,22 @@ local mht = s:taboption("advanced", Value, "mask_host",
 local mpp = s:taboption("advanced", ListValue, "mask_proxy_protocol",
     "Mask Proxy Protocol" .. tip("Send PROXY protocol header to mask_host (if behind HAProxy/Nginx).")); mpp:value("0",
     "0 (Off)"); mpp:value("1", "1 (v1 - Text)"); mpp:value("2", "2 (v2 - Binary)"); mpp.default = "0"
+
+-- 3.4.18: mask_dynamic. Binary default is ON. Surfaced so the behavioural
+-- change (fallback masking uses ClientHello SNI when mask_host is empty) is explicit.
+local mdyn = s:taboption("advanced", Flag, "mask_dynamic",
+    "Dynamic SNI Mask Target" .. tip("When ON and Mask Host is empty, fallback masking uses the SNI from the client's ClientHello (must match a configured TLS domain). Turn OFF for the old static behaviour."))
+mdyn.default = "1"
+
+-- 3.4.18: client_mss (global). Helps clients behind TSPU/DPI by clamping MSS.
+-- Empty = kernel default (recommended unless you know you need it).
+local cmss = s:taboption("advanced", ListValue, "client_mss",
+    "Client TCP MSS" .. tip("Clamp the client-facing TCP MSS. 'tspu'/'extreme-low' can help punch through DPI fragmentation. Default (empty) keeps the kernel value."))
+cmss:value("", "Default (kernel)")
+cmss:value("tspu", "tspu (92)")
+cmss:value("extreme-low", "extreme-low (88)")
+cmss:value("2in8", "2in8 (256)")
+cmss.default = ""
 local aip = s:taboption("advanced", Value, "announce_ip",
     "Announce Address" .. tip("Optional. Public IP or Domain for tg:// links. Overrides 'External IP' if set.")); aip.datatype =
 "string"; aip.validate = validate_ip_domain
@@ -828,6 +840,18 @@ local mport = s:taboption("advanced", Value, "metrics_port",
 local aport = s:taboption("advanced", Value, "api_port",
     "Control API Port" .. tip("Port for the REST API (v1). Default: 9091.")); aport.datatype = "port"; aport.default =
 "9091"
+
+local mladdr = s:taboption("advanced", ListValue, "metrics_listen_addr",
+    "Prometheus Bind Address" .. tip("Loopback = 127.0.0.1 only (safe). All interfaces = 0.0.0.0, reachable from LAN/WAN. When exposed, the whitelist below is the only access guard."))
+mladdr:value("127.0.0.1", "Loopback only (127.0.0.1)")
+mladdr:value("0.0.0.0", "All interfaces (0.0.0.0)")
+mladdr.default = "127.0.0.1"
+
+local aladdr = s:taboption("advanced", ListValue, "api_listen_addr",
+    "Control API Bind Address" .. tip("Loopback = 127.0.0.1 only (safe). All interfaces = 0.0.0.0, reachable from LAN/WAN. The API whitelist is shared with the metrics whitelist — exposing the API allows remote user/quota mutation for any whitelisted host. Keep the whitelist tight and never open this port on WAN."))
+aladdr:value("127.0.0.1", "Loopback only (127.0.0.1)")
+aladdr:value("0.0.0.0", "All interfaces (0.0.0.0)")
+aladdr.default = "127.0.0.1"
 s:taboption("advanced", Flag, "metrics_allow_lo", "Allow Localhost" .. tip("Auto-allow 127.0.0.1 and ::1. Required for Live Traffic stats.")).default =
 "1"
 s:taboption("advanced", Flag, "metrics_allow_lan", "Allow LAN Subnet" .. tip("Auto-detect and allow your router's local network.")).default =
@@ -1212,7 +1236,7 @@ function formatMB(bytes) { if(!bytes || bytes === 0) return '0.00 MB'; var mb = 
 function formatUptime(secs) { if(!secs) return '0s'; var d = Math.floor(secs/86400), h = Math.floor((secs%86400)/3600), m = Math.floor((secs%3600)/60), s = Math.floor(secs%60); var str = ""; if(d>0) str += d+"d "; if(h>0 || d>0) str += h+"h "; str += m+"m "+s+"s"; return str; }
 
 // ONLY use cleanResponse for Prometheus parsing. Log content bypasses this to preserve HTTP artifacts.
-function cleanResponse(txt) { if (!txt) return ''; var m = txt.search(/<(!DOCTYPE|html[\s>]|!--\s*Lua compatibility mode active:)/i); if (m > 0) return txt.substring(0, m).trim(); return txt; }
+function cleanResponse(txt) { if (!txt) return ''; var cut = txt.search(/<(!DOCTYPE|html[\s>])/i); if (cut > 0) return txt.substring(0, cut).trim(); return txt; }
 
 // -----------------------------------------------------------------------------
 // DEBOUNCED SPOILER REPACKER
@@ -1822,6 +1846,9 @@ function fetchMetrics() {
     }).catch(err => {
         window._telemtFetching = false;
         if (err && err.name === 'AbortError') { console.warn('[Telemt] Metrics fetch timeout, skipping update'); return; }
+        setOfflineState();
+        var sEl = document.getElementById('dash_status');
+        if (sEl) { sEl.innerText = 'STOPPED / CONNECTION LOST'; sEl.style.color = '#d9534f'; }
     }).finally(() => {
         window._telemtFetching = false;
     });
@@ -1875,7 +1902,8 @@ function loadLog() {
     fetch(lu_current_url.split('#')[0] + (lu_current_url.indexOf('?') > -1 ? '&' : '?') + 'get_log=1&_t=' + Date.now())
     .then(r => r.text()).then(txt => {
         txt = txt || '';
-        txt = cleanResponse(txt).replace(/<!--\s*Lua compatibility mode active:[\s\S]*$/i, '').trim();
+        var htmlTail = txt.lastIndexOf('<!DOCTYPE');
+        if (htmlTail > 0 && htmlTail > txt.length * 0.8) { txt = txt.substring(0, htmlTail).trim(); }
         // Strip binary ISO timestamp (e.g. "2026-03-16T11:13:16.717471Z ") — logread already prefixes date+time
         txt = txt.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s*/g, '');
         document.getElementById('telemt_log_container').textContent = txt || 'No logs found.';
@@ -2301,10 +2329,49 @@ function initTelemt() {
             for (var i = 0; i < mutations.length; i++) { if (mutations[i].target.id === 'cbi-telemt-user' || mutations[i].target.id === 'cbi-telemt-upstream' || (mutations[i].target.closest && mutations[i].target.closest('#cbi-telemt-user'))) { needsUpdate = true; break; } }
             if (needsUpdate) { _injecting = true; injectUI(); updateLinks(); _injecting = false; }
         });
-        domObserver.observe(document.getElementById('maincontent') || document.body, { childList: true, subtree: true });
+        domObserver.observe(document.getElementById('maincontent') || document.querySelector('.cbi-map') || document.body, { childList: true, subtree: true });
     } else { setInterval(function(){ injectUI(); updateLinks(); scheduleRepack(); }, 2500); }
 }
-if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', initTelemt); } else { initTelemt(); }
+// Theme-agnostic bootstrap.
+// Default/bootstrap themes do a full page load (DOMContentLoaded fires with the
+// CBI DOM present). AJAX-routing themes (Argon, Material) swap #maincontent via
+// XHR, so this inline script can run BEFORE the CBI map exists — DOMContentLoaded
+// already passed and #cbi-telemt-general isn't there yet. A one-shot initTelemt()
+// then runs against an empty DOM: fetchMetrics() bails, status stays PENDING.
+// Fix: poll for the CBI DOM (bounded) and only fire initTelemt once it appears.
+var _telemtBootstrapped = false;
+function _telemtTryBootstrap() {
+    if (_telemtBootstrapped) return true;
+    // The status panel and the general map are the anchors fetchMetrics needs.
+    if (document.getElementById('dash_status') ||
+        document.getElementById('cbi-telemt-general') ||
+        document.getElementById('cbi-telemt-user')) {
+        _telemtBootstrapped = true;
+        try { initTelemt(); } catch (e) { console.error('[Telemt UI] init failed', e); }
+        return true;
+    }
+    return false;
+}
+(function _telemtBootstrapLoop() {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', _telemtBootstrapLoop, { once: true });
+        return;
+    }
+    if (_telemtTryBootstrap()) return;
+    // CBI DOM not present yet (AJAX theme still swapping content). Retry on an
+    // interval, and also watch the document for the map being inserted late.
+    var tries = 0;
+    var bootTimer = setInterval(function() {
+        tries++;
+        if (_telemtTryBootstrap() || tries > 100) { clearInterval(bootTimer); }
+    }, 150); // up to ~15s of patience for slow AJAX renders
+    if (typeof window.MutationObserver !== 'undefined') {
+        var bootObs = new MutationObserver(function() {
+            if (_telemtTryBootstrap()) { bootObs.disconnect(); clearInterval(bootTimer); }
+        });
+        bootObs.observe(document.body, { childList: true, subtree: true });
+    }
+})();
 </script>
 ]] .. (m.description or "")
 
