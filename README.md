@@ -40,6 +40,7 @@
         <li><b>Маскировка:</b> Нативная поддержка PROXY protocol (для Nginx/HAProxy), Shadowsocks upstream и генерация FakeTLS ссылок (QR-коды).</li>
         <li><b>Внешний доступ к метрикам и API:</b> Настраиваемые bind-адреса (<code>metrics_listen_addr</code> / <code>api_listen_addr</code>) — Loopback или All interfaces. По умолчанию loopback; доступ наружу ограничен whitelist.</li>
         <li><b>Тюнинг под DPI:</b> Глобальный <code>client_mss</code> (клампинг TCP MSS, пресеты <code>tspu</code>/<code>extreme-low</code>) и динамическая SNI-маскировка (<code>mask_dynamic</code>) — помогает пробивать TSPU-блокировки.</li>
+        <li><b>Честная диагностика связи:</b> Статус апстримов по реальной достижимости DC (OK / DEGRADED), бейдж TG Path различает прямой и проксированный трафик, кнопка прямой пробы DC с роутера в обход метрик.</li>
       </ul>
     </td>
     <td valign="top">
@@ -74,6 +75,7 @@
         <li><b>Stealth:</b> Native PROXY protocol support (for HAProxy/Nginx), Shadowsocks upstream, and one-click FakeTLS link/QR-code generation.</li>
         <li><b>External Metrics &amp; API access:</b> Configurable bind addresses (<code>metrics_listen_addr</code> / <code>api_listen_addr</code>) — Loopback or All interfaces. Defaults to loopback; external access is whitelist-gated.</li>
         <li><b>DPI Tuning:</b> Global <code>client_mss</code> (TCP MSS clamp, presets <code>tspu</code>/<code>extreme-low</code>) and dynamic SNI masking (<code>mask_dynamic</code>) to help punch through TSPU-style blocking.</li>
+        <li><b>Honest connectivity diagnostics:</b> Upstream status reflects real DC reachability (OK / DEGRADED), the TG Path badge distinguishes direct vs proxied traffic, and an on-router DC probe button checks reachability bypassing the metrics API.</li>
       </ul>
     </td>
   </tr>
@@ -109,11 +111,14 @@ apk add --allow-untrusted luci-app-telemt_3.4.0_noarch.apk
   <tr>
     <td valign="top"><b>3.4.0</b><br><small>Release Candidate</small></td>
     <td valign="top">
-      <b>Внешние метрики/API, client_mss, динамическая SNI-маска и совместимость с AJAX-темами (Argon)</b><br>
+      <b>Внешние метрики/API, client_mss, динамическая SNI-маска, честная диагностика связи и совместимость с AJAX-темами (Argon)</b><br>
       <ul>
         <li><b>Bind-адреса:</b> Новые <code>metrics_listen_addr</code> и <code>api_listen_addr</code> (дропдаун Loopback / All interfaces). Дефолт <code>127.0.0.1</code> — безопасное loopback-поведение сохранено при обновлении. Чинит «метрики недоступны снаружи»: раньше <code>metrics_listen</code> не эмитился вовсе и ядро падало на loopback, а API был жёстко на <code>0.0.0.0</code>.</li>
         <li><b>client_mss (ядро 3.4.18):</b> Глобальный клампинг TCP MSS в <code>[server]</code>. Пресеты <code>tspu</code> / <code>extreme-low</code> / <code>2in8</code> для абонентов за TSPU/DPI. Пусто = дефолт ядра.</li>
         <li><b>mask_dynamic (ядро 3.4.18):</b> Вынесен как Flag (дефолт ON, как в бинарнике). Делает явным изменение поведения: при пустом <code>mask_host</code> fallback-маскировка берёт SNI из ClientHello (только если он совпадает с настроенным TLS-доменом).</li>
+        <li><b>Честный статус апстримов:</b> Маршрут больше не светится зелёным «OK» только по флагу <code>healthy</code> ядра. Если транспорт жив, но ни один Telegram DC через него не достижим (все <code>dc[].latency_ema_ms</code> = null) — статус <b>DEGRADED</b> (жёлтый). Лечит ситуацию, когда <code>direct</code> показывался рабочим, хотя DC через него недоступны.</li>
+        <li><b>Честный TG Path:</b> Бейдж режима больше не показывает «Direct-DC», когда трафик реально идёт через прокси/VLESS. Теперь <b>«via SOCKS5/Mixed»</b>, если есть апстримы, и <b>«Direct»</b> — только при реально прямом egress без прокси.</li>
+        <li><b>Проба DC с роутера:</b> Кнопка <b>Probe DCs from router</b> в панели Telegram Path — реальный TCP-connect к DC1–DC5 прямо с роутера, в обход метрик ядра. Показывает наземную правду о достижимости DC (<code>N/5 reachable</code>), которую stats API дать не может.</li>
         <li><b>Argon / Material fix:</b> Bootstrap фронтенда ждёт реального появления CBI-DOM (таймер + <code>MutationObserver</code>) вместо одноразового <code>DOMContentLoaded</code>. Лечит пропадание статуса/PID/RSS под AJAX-роутящими темами (бинарник работает, а UI показывает «не запущен»). На сток-темах нагрузка и поведение не изменились.</li>
         <li><b>Observer target:</b> Основной <code>MutationObserver</code> теперь <code>#maincontent</code> → <code>.cbi-map</code> → <code>body</code> — не зависит от наличия <code>#maincontent</code>.</li>
         <li><b>IPv4-only control-plane:</b> Валидатор <code>is_bind_addr</code> принимает только <code>127.0.0.1</code>/<code>0.0.0.0</code> (значения dropdown); мусор отбрасывается на loopback. <code>socket_addr()</code> с bracket-нотацией оставлен как защита на будущее.</li>
