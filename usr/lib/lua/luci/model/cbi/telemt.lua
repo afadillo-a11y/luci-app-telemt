@@ -187,7 +187,41 @@ if http.formvalue("get_bot_status") == "1" then
     http.prepare_content("application/json"); pcall(function() http.write(status_json) end); end_ajax(); return
 end
 
--- RCE VULNERABILITY FIX: Strict validation of username before shell execution
+-- Direct on-router DC reachability probe.
+-- Independent of the core's metrics: opens a real TCP connection from the
+-- router to each Telegram DC IP:443 and reports which are reachable. This is
+-- the ground truth the metrics API can't give — the core may report an
+-- upstream "healthy" while DCs are actually unreachable through it.
+if http.formvalue("get_dc_probe") == "1" then
+    -- Canonical Telegram DC IPv4 endpoints (DC1..DC5).
+    local dcs = {
+        ["1"] = "149.154.175.50",
+        ["2"] = "149.154.167.51",
+        ["3"] = "149.154.175.100",
+        ["4"] = "149.154.167.91",
+        ["5"] = "149.154.171.5",
+    }
+    -- One TCP connect per DC, 3s timeout, via busybox nc. Returns "ok"/"fail".
+    -- nc -w applies a connect+io timeout; -z would be ideal but busybox nc
+    -- lacks it, so we connect and immediately close stdin via </dev/null.
+    local function probe(ip)
+        local cmd = string.format(
+            "nc -w 3 %q 443 </dev/null >/dev/null 2>&1 && echo ok || echo fail", ip)
+        local r = (sys.exec(cmd) or ""):gsub("%s+", "")
+        return r == "ok"
+    end
+    local parts = {}
+    local reachable = 0
+    for _, n in ipairs({"1","2","3","4","5"}) do
+        local ok = probe(dcs[n])
+        if ok then reachable = reachable + 1 end
+        parts[#parts+1] = '"' .. n .. '":' .. (ok and "true" or "false")
+    end
+    local json = '{"ok":true,"reachable":' .. reachable ..
+        ',"total":5,"dc":{' .. table.concat(parts, ",") .. '}}'
+    http.prepare_content("application/json"); pcall(function() http.write(json) end); end_ajax(); return
+end
+
 if is_post and http.formvalue("auto_pause_user") then
     local u = http.formvalue("auto_pause_user"); local reason = http.formvalue("reason") or "Limit Exceeded"
     if u and u:match("^[A-Za-z0-9_]+$") then
@@ -1232,6 +1266,36 @@ var is_owrt25 = ]] .. is_owrt25_lua .. [[;
 
 function logAction(msg, data) { console.log("[Telemt UI] " + msg); }
 function escHTML(s) { return String(s).replace(/[&<>'"]/g, function(c) { return '&#' + c.charCodeAt(0) + ';'; }); }
+
+// On-router DC reachability probe. Calls the server-side ?get_dc_probe action,
+// which TCP-connects from the router to each Telegram DC — ground truth that
+// the metrics API can't provide (core may call an upstream healthy while DCs
+// are unreachable through it).
+function telemtProbeDCs() {
+    var btn = document.getElementById('btn_dc_probe');
+    var out = document.getElementById('dc_probe_result');
+    if (!out) return;
+    if (btn) { btn.disabled = true; btn.value = 'Probing\u2026'; }
+    out.innerHTML = '<span style="opacity:0.7;">Connecting to DC1\u2013DC5 from the router\u2026</span>';
+    var base = lu_current_url.split('#')[0];
+    var sep = base.indexOf('?') >= 0 ? '&' : '?';
+    fetch(base + sep + 'get_dc_probe=1', { method: 'GET' })
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+            if (!j || !j.ok) { out.innerHTML = '<span style="color:#d9534f;">Probe failed.</span>'; return; }
+            var cells = [];
+            for (var n=1; n<=5; n++) {
+                var ok = j.dc && j.dc[String(n)];
+                cells.push('<span style="color:' + (ok ? '#00a000' : '#d9534f') + ';">DC' + n + ':' + (ok ? '\u2713' : '\u2717') + '</span>');
+            }
+            var verdict = (j.reachable === 0)
+                ? '<span style="color:#d9534f; font-weight:bold;">No DC reachable directly from router</span>'
+                : '<b>' + j.reachable + '/' + j.total + ' DC reachable</b> from router (direct TCP)';
+            out.innerHTML = verdict + '<br>' + cells.join(' &nbsp; ');
+        })
+        .catch(function(){ out.innerHTML = '<span style="color:#d9534f;">Probe error.</span>'; })
+        .then(function(){ if (btn) { btn.disabled = false; btn.value = 'Probe DCs from router'; } });
+}
 function formatMB(bytes) { if(!bytes || bytes === 0) return '0.00 MB'; var mb = bytes / 1048576; if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB'; return mb.toFixed(2) + ' MB'; }
 function formatUptime(secs) { if(!secs) return '0s'; var d = Math.floor(secs/86400), h = Math.floor((secs%86400)/3600), m = Math.floor((secs%3600)/60), s = Math.floor(secs%60); var str = ""; if(d>0) str += d+"d "; if(h>0 || d>0) str += h+"h "; str += m+"m "+s+"s"; return str; }
 
@@ -1484,10 +1548,23 @@ function renderHealthGrid(apiData, promText, upData, upqData) {
 
     // TG PATH badge
     var tgPath, tgPathCls;
-    if (rt.me_runtime_ready) { tgPath = 'ME'; tgPathCls = 'badge-ok'; }
-    else if (uciMpEnabled && !rt.me_runtime_ready) { tgPath = 'Fallback'; tgPathCls = 'badge-warn'; }
-    else { tgPath = 'Direct-DC'; tgPathCls = 'badge-info'; }
-    var tgPathBadge = '<span class="badge ' + tgPathCls + '" title="Telegram transport path: how traffic reaches Telegram DCs. ME = Middle-End pool, Direct-DC = TCP to DC, Fallback = ME configured but not ready.">TG Path: ' + tgPath + '</span>';
+    if (rt.me_runtime_ready) {
+        tgPath = 'ME'; tgPathCls = 'badge-ok';
+    } else if (uciMpEnabled && !rt.me_runtime_ready) {
+        tgPath = 'Fallback'; tgPathCls = 'badge-warn';
+    } else {
+        // Transport mode is Direct-DC (TCP to DC, not Middle-End). But that does
+        // NOT mean traffic leaves the router directly: it still goes through any
+        // configured upstream proxies. Only call it "Direct" when egress is
+        // genuinely direct; otherwise name the actual egress so a non-expert
+        // doesn't read "Direct-DC" as "no proxy".
+        if (egress.type === 'Direct') {
+            tgPath = 'Direct'; tgPathCls = 'badge-info';
+        } else {
+            tgPath = 'via ' + egress.type; tgPathCls = 'badge-ok';
+        }
+    }
+    var tgPathBadge = '<span class="badge ' + tgPathCls + '" title="How traffic reaches Telegram DCs. ME = Middle-End pool. Direct = TCP straight from the router (no upstream proxy). via SOCKS5/Mixed = TCP to DC but routed through your upstream proxy/VLESS. Fallback = ME configured but not ready.">TG Path: ' + tgPath + '</span>';
 
     // EGRESS badge
     var egressCls = egress.type === 'Direct' ? 'badge-info' : 'badge-ok';
@@ -1559,15 +1636,34 @@ function renderHealthGrid(apiData, promText, upData, upqData) {
             var uHtml = '<div style="display:flex; justify-content:space-between; font-weight:bold; opacity:0.7; border-bottom:1px solid rgba(128,128,128,0.3); padding-bottom:4px; margin-bottom:4px;"><div style="flex:1">Address</div><div style="flex:0 0 60px; text-align:right;">Status</div><div style="flex:0 0 50px; text-align:right;">Fails</div><div style="flex:0 0 75px; text-align:right;">Lat</div></div>';
             for (var i=0; i<ups.length; i++) {
                 var up = ups[i] || {};
-                var stCol = up.healthy ? '<span style="color:#00a000">OK</span>' : '<span style="color:#d9534f">FAIL</span>';
+                // healthy alone is misleading: the core marks an upstream
+                // healthy as a transport even when no DC is reachable through
+                // it (all dc[].latency_ema_ms null / effective_latency_ms null).
+                // Split into OK (healthy + >=1 reachable DC) vs DEGRADED.
+                var dcArr = Array.isArray(up.dc) ? up.dc : [];
+                var liveDc = 0;
+                for (var dci=0; dci<dcArr.length; dci++) {
+                    if (dcArr[dci] && dcArr[dci].latency_ema_ms != null) liveDc++;
+                }
+                var hasDcData = dcArr.length > 0;
+                var stCol;
+                if (!up.healthy) {
+                    stCol = '<span style="color:#d9534f">FAIL</span>';
+                } else if (hasDcData && liveDc === 0) {
+                    stCol = '<span style="color:#e0a800" title="Transport healthy but no Telegram DC reachable through this route">DEGRADED</span>';
+                } else {
+                    stCol = '<span style="color:#00a000">OK</span>';
+                }
                 var latStr = (up.effective_latency_ms != null) ? parseFloat(up.effective_latency_ms).toFixed(1) + 'ms' : '—';
                 uHtml += '<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed rgba(128,128,128,0.15);"><div style="flex:1; word-break:break-all; padding-right:5px;">' + escHTML(up.address || '-') + '</div><div style="flex:0 0 60px; text-align:right;">' + stCol + '</div><div style="flex:0 0 50px; text-align:right;">' + (up.fails || 0) + '</div><div style="flex:0 0 75px; text-align:right;">' + latStr + '</div></div>';
-                // Per-DC latency sub-rows from upstream_quality (if available)
+                // Per-DC latency sub-rows: prefer upstream_quality, else the
+                // inline dc[] already present in /v1/stats/upstreams.
                 var qEntry = upqLookup[up.address];
-                if (qEntry && Array.isArray(qEntry.dc) && qEntry.dc.length > 0) {
+                var dcSrc = (qEntry && Array.isArray(qEntry.dc) && qEntry.dc.length > 0) ? qEntry.dc : dcArr;
+                if (Array.isArray(dcSrc) && dcSrc.length > 0) {
                     var dcParts = [];
-                    for (var d=0; d<qEntry.dc.length && d<6; d++) {
-                        var dcR = qEntry.dc[d];
+                    for (var d=0; d<dcSrc.length && d<6; d++) {
+                        var dcR = dcSrc[d];
                         var dcLat = (dcR.latency_ema_ms != null) ? parseFloat(dcR.latency_ema_ms).toFixed(0) + 'ms' : '—';
                         dcParts.push('DC' + dcR.dc + ':' + dcLat);
                     }
@@ -1622,7 +1718,11 @@ function renderHealthGrid(apiData, promText, upData, upqData) {
         } else {
             // Mode B: Direct-DC path (possibly via upstream)
             var pathParts = [];
-            pathParts.push('<b>TG Path:</b> Direct-DC' + (egress.type !== 'Direct' ? ' over ' + egress.type : ''));
+            if (egress.type === 'Direct') {
+                pathParts.push('<b>TG Path:</b> Direct (TCP straight from router, no upstream)');
+            } else {
+                pathParts.push('<b>TG Path:</b> via ' + egress.type + ' upstream <span style="opacity:0.7;">(Direct-DC mode, routed through your proxy/VLESS)</span>');
+            }
             if (egress.total > 0) {
                 pathParts.push('<b>Upstream:</b> ' + egress.ok + '/' + egress.total + ' healthy');
             }
@@ -1630,6 +1730,12 @@ function renderHealthGrid(apiData, promText, upData, upqData) {
             if (uciMpEnabled) {
                 pathParts.push('<span style="color:#d35400;">ME is configured but not ready. Traffic uses Direct-DC as fallback.</span>');
             }
+            pathParts.push('<div style="margin-top:8px; padding-top:8px; border-top:1px dashed rgba(128,128,128,0.3);">' +
+                '<input type="button" id="btn_dc_probe" value="Probe DCs from router" ' +
+                'class="cbi-button cbi-button-action" style="font-size:0.85em;" ' +
+                'onclick="telemtProbeDCs()" />' +
+                '<div id="dc_probe_result" style="margin-top:6px; font-size:0.9em; opacity:0.85;"></div>' +
+                '</div>');
             dDc.innerHTML = '<div style="color:inherit; padding:10px; line-height:1.8;">' + pathParts.join('<br>') + '</div>';
         }
     }
